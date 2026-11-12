@@ -1036,3 +1036,27 @@ test('build: a tunnel is a network, and its peers stand under it', () => {
 	], 'each peer with the addresses it holds inside the tunnel');
 	assert.deepEqual(model.build({ ifaces: m.networks.length ? undefined : [] }).networks, [], 'no ifaces, no networks');
 });
+
+/* the plugin reads the lease itself: a name even when the host hints are
+   empty for that MAC */
+test('build: a host named by the lease the plugin read', () => {
+	const m = model.build({
+		ifaces: [ { interface: 'lan', up: true, l3_device: 'eth0', device: 'eth0', 'ipv4-address': [ { address: '192.0.2.1', mask: 24 } ] } ],
+		devs: { eth0: { devtype: 'ethernet' } },
+		hints: {},
+		fdb: [ { mac: '02:00:5e:00:53:88', port: 'eth0', bridge: null, vlan: null, seen: null,
+			ip: '192.0.2.88', name: 'livingroom-tv', approx: true } ]
+	});
+	const h = m.wiredHosts[0];
+	assert.equal(h.name, 'livingroom-tv', 'the lease name stands in');
+	assert.equal(h.nameSource, 'dhcp');
+	assert.deepEqual(h.ips, [ '192.0.2.88' ]);
+	/* a name the hints do carry wins over the plugin's copy */
+	const n = model.build({
+		ifaces: [ { interface: 'lan', up: true, l3_device: 'eth0', device: 'eth0', 'ipv4-address': [ { address: '192.0.2.1', mask: 24 } ] } ],
+		devs: { eth0: { devtype: 'ethernet' } },
+		hints: { '02:00:5E:00:53:88': { name: 'appletv', ipaddrs: [ '192.0.2.88' ] } },
+		fdb: [ { mac: '02:00:5e:00:53:88', port: 'eth0', bridge: null, vlan: null, seen: null, name: 'livingroom-tv', approx: true } ]
+	});
+	assert.equal(n.wiredHosts[0].name, 'appletv');
+});

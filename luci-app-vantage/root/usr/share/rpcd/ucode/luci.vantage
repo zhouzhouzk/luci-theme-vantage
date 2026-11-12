@@ -88,6 +88,7 @@ const PROBE4 = '198.51.100.1';    // routes: looked up, never sent to (documenta
 const PROBE6 = '2001:db8::1';
 const NET = '/sys/class/net';
 const ARP = '/proc/net/arp';      // complete entries: address, flags, MAC, device
+const LEASES = '/tmp/dhcp.leases';// dnsmasq: expiry, MAC, address, host name, client id
 const FDB_LIMIT = 4096;           // forwarding entries, all bridges together, before wired() lists none
 const FDB_ENTRY = 16;             // sizeof(struct __fdb_entry), brforward's record
 const FDB_DUMP_S = 30;            // the netlink dump at least this often (VLANs, static entries)
@@ -125,6 +126,7 @@ const RE_VLAN_DEV = /^[A-Za-z0-9_-]{1,10}\.([0-9]{1,4})$/;  // 'eth1.1'
 const RE_ARP = /^(\S+)\s+\S+\s+(0x[0-9a-f]{1,8})\s+(\S+)\s+\S+\s+(\S+)/;
 const RE_WAN_DEV = /^(wan|ppp|pppoe|wwan)/;   // a peer beyond these is not a client
 const RE_IPV4 = /^[0-9]{1,3}(\.[0-9]{1,3}){3}$/;
+const RE_LEASE = /^\S+\s+(\S+)\s+(\S+)\s+(\S+)/;   // expiry, MAC, address, name
 /* peer sections: config amneziawg_awg0 / wireguard_wg0 -> interface awg0 */
 const RE_VPN_SECTION = /^(amneziawg|wireguard)_([A-Za-z0-9_.-]{1,15})$/;
 const RE_CIDR = /^[0-9a-fA-F:.]{2,45}\/[0-9]{1,3}$/;
@@ -613,6 +615,39 @@ function bridge_table() {
 	return { sig, ages, multi };
 }
 
+// The names dnsmasq handed out, by MAC: the one thing that makes a list of
+// addresses readable. Read on every call (a few kilobytes), so a device
+// that renames itself needs no restart, and no lease at all is no error.
+function lease_names() {
+	let out = {}, text = readfile(LEASES);
+
+	if (type(text) != 'string')
+		return out;
+
+	for (let line in split(text, '\n')) {
+		let f = match(line, RE_LEASE);
+
+		if (!f || f[3] == '*')
+			continue;
+
+		let mac = norm_mac(f[1]);
+
+		if (mac && length(f[3]) <= 64)
+			out[mac] = f[3];
+	}
+
+	return out;
+}
+
+// a lease name on the hosts no host hint names
+function with_names(hosts, names) {
+	for (let h in hosts)
+		if (h.name == null && names[h.mac] != null)
+			h.name = names[h.mac];
+
+	return hosts;
+}
+
 // The hosts /proc/net/arp lists as complete (flags 0x2) on an interface
 // that is not a WAN: the answer when the bridges learned nothing, either
 // because the LAN is not a Linux bridge or because the dump could not be
@@ -652,18 +687,36 @@ function arp_hosts() {
 // Configuration is read; no key, and nothing written. Read group
 // luci-app-vantage.
 function vpn() {
-	let out = {}, cur = cursor();
+	let out = {}, tunnels = {}, cur = cursor();
 
 	if (!cur.load(NETWORK))
 		return out;
 
-	cur.foreach(NETWORK, (s) => {
-		let m = (type(s['.type']) == 'string') ? match(s['.type'], RE_VPN_SECTION) : null;
+	// the tunnel interfaces first: a peer section that does not name its
+	// interface still belongs to the one whose addresses hold its subnet
+	cur.foreach(NETWORK, 'interface', (s) => {
+		if (s.proto == 'amneziawg' || s.proto == 'wireguard')
+			tunnels[s['.name']] = 1;
+	});
 
-		if (!m || s.disabled === '1')
+	cur.foreach(NETWORK, (s) => {
+		if (s.disabled === '1' || s.allowed_ips == null)
 			return;
 
-		let iface = m[2], peers = out[iface] ?? [];
+		let t = type(s['.type']) == 'string' ? s['.type'] : '';
+		let m = match(t, RE_VPN_SECTION), iface = null;
+
+		if (m)
+			iface = m[2];
+		else if (type(s.interface) == 'string' && tunnels[s.interface])
+			iface = s.interface;                 // option interface 'awg0'
+		else if (tunnels[t])
+			return;                              // the interface itself, not a peer
+
+		if (iface == null)
+			return;
+
+		let peers = out[iface] ?? [];
 
 		if (length(peers) >= MAX_PEERS)
 			return;
@@ -703,6 +756,7 @@ function wired() {
 		return null;
 
 	let now = clock(true)?.[0] ?? 0;
+	let names = lease_names();
 
 	// the same hosts on the same ports: the last dump's, heard as now
 	// (not when a MAC sits on two ports: each row's own time is the dump's)
@@ -713,7 +767,7 @@ function wired() {
 			return { mac: h.mac, port: h.port, bridge: h.bridge, vlan: h.vlan, seen: a ? int(a[fdb_le ? 0 : 1] / 100) : h.seen };
 		});
 
-		return length(same) ? same : arp_hosts();
+		return with_names(length(same) ? same : arp_hosts(), names);
 	}
 
 	let fdb = rtnl.request(rtnl.const.RTM_GETNEIGH, rtnl.const.NLM_F_DUMP, { family: rtnl.const.AF_BRIDGE });
@@ -756,7 +810,7 @@ function wired() {
 	fdb_last = (type(fdb) == 'array') ? { at: now, sig: tb.sig, hosts: out } : null;
 
 	// the bridges learned nothing: the ARP table still lists the LAN's hosts
-	return length(out) ? out : arp_hosts();
+	return with_names(length(out) ? out : arp_hosts(), names);
 }
 
 // [ { family, dev, metric } ] for the families whose lookup answers with

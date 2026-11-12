@@ -762,7 +762,8 @@ return baseclass.extend({
 			if (prev && (seen == null || (prev.seen != null && prev.seen <= seen))) return;
 			if (!prev) wiredMacs.push(mac);
 			fdb[mac] = { port: h.port, bridge: typeof h.bridge === 'string' ? h.bridge : null, vlan: finite(h.vlan) ? h.vlan : null, seen: seen,
-				approx: h.approx === true, ip: typeof h.ip === 'string' ? h.ip : null };
+				approx: h.approx === true, ip: typeof h.ip === 'string' ? h.ip : null,
+				name: typeof h.name === 'string' && h.name ? h.name : null };
 		});
 		/* a gateway, by the address the host hints give it; on a bridge
 		   with several ports a line is the port it was learned on */
@@ -916,6 +917,13 @@ return baseclass.extend({
 		wiredMacs.forEach(function(mac) { var p = fdb[mac].port; perPort[p] = (perPort[p] || 0) + 1; });
 		var wired = wiredMacs.map(function(mac) {
 			var h = fdb[mac], d = devs[h.port], hint = hintOf(mac), ips = self.hintAddrs(hint, wiredSubnets(mac));
+			/* the lease name the plugin read, where the host hints carry none */
+			if (!hint.name && h.name) {
+				var named = {}, namedKeys = Object.keys(hint);
+				for (var nk = 0; nk < namedKeys.length; nk++) named[namedKeys[nk]] = hint[namedKeys[nk]];
+				named.name = h.name;
+				hint = named;
+			}
 			/* the ARP table's own address: the host hints carry leases and
 			   announcements only, so a device on a static address is in
 			   neither and would otherwise be listed without one */
