@@ -786,6 +786,45 @@ function vpn() {
 		push(dbg.tunnels, s['.name'] + ' ' + s.proto + ' ' + join(',', map(nets, (n) => n.text)));
 	});
 
+	// The interfaces the dashboard itself draws, from netifd's dump: the
+	// page's network nodes come from here, so a node it shows is a tunnel
+	// this call knows about, whatever the configuration calls it.
+	try {
+		let dump = connect()?.call('network.interface', 'dump', {});
+
+		for (let i in ((dump && type(dump.interface) == 'array') ? dump.interface : [])) {
+			if (type(i) != 'object' || (i.proto != 'amneziawg' && i.proto != 'wireguard'))
+				continue;
+
+			let t = tunnels[i.interface] ?? { nets: [], own: {} };
+
+			for (let a in (type(i['ipv4-address']) == 'array' ? i['ipv4-address'] : [])) {
+				let m = (type(a) == 'object') ? match((a.address ?? '') + '/' + (a.mask ?? 32), RE_NET) : null;
+
+				if (!m)
+					continue;
+
+				let num = ip4num(m[1]), bits = +m[3];
+
+				if (num == null || bits < 0 || bits > 32)
+					continue;
+
+				push(t.nets, { base: num, bits, text: m[1] + '/' + bits });
+				t.own[m[1]] = 1;
+			}
+
+			if (!length(t.nets))
+				continue;
+
+			tunnels[i.interface] = t;
+
+			if (!tun_seen[i.interface]) {
+				tun_seen[i.interface] = 1;
+				push(dbg.tunnels, i.interface + ' ' + i.proto + ' (netifd) ' + join(',', map(t.nets, (n) => n.text)));
+			}
+		}
+	} catch (e) { }
+
 	// The same from the kernel, for a tunnel uci does not describe (a peer
 	// set with `awg setconf`, an interface made by a script): the addresses
 	// its device holds say which subnet its peers live in.
