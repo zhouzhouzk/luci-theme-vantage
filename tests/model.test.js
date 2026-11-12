@@ -507,11 +507,14 @@ test('networks: other interfaces, not loopback or the uplink, one per device', (
 	const up = model.resolveUplink(ifaces, {});
 	assert.equal(up.iface, 'wan');
 	assert.deepEqual(model.networks(ifaces, up), [
-		{ name: 'guest', proto: 'static', dev: 'br-guest', up: false, ipv4: null },
-		{ name: 'lan', proto: 'static', dev: 'br-lan', up: true, ipv4: '198.51.100.1/24' },
-		{ name: 'vpn', proto: 'wireguard', dev: 'wg0', up: true, ipv4: '203.0.113.1/24' }
+		{ name: 'guest', proto: 'static', dev: 'br-guest', up: false, ipv4: null, peers: [] },
+		{ name: 'lan', proto: 'static', dev: 'br-lan', up: true, ipv4: '198.51.100.1/24', peers: [] },
+		{ name: 'vpn', proto: 'wireguard', dev: 'wg0', up: true, ipv4: '203.0.113.1/24', peers: [] }
 	]);
 	assert.deepEqual(model.networks(null, null), []);
+	/* the tunnel's peers ride along with the network they belong to */
+	assert.deepEqual(model.networks(ifaces, up, { vpn: [ { desc: 'phone', ips: [ '203.0.113.9/32' ] } ] })[2].peers,
+		[ { name: 'phone', ips: [ '203.0.113.9/32' ] } ]);
 });
 
 test('temps: hottest first, millidegrees to degrees, implausible readings left out', () => {
@@ -990,4 +993,46 @@ test('build: wired hosts from the host hints when the forwarding table is empty'
 	/* a forwarding entry is the better answer: no fallback then */
 	const n = model.build({ ifaces, devs, hints, fdb: [ { mac: '00:00:5e:00:53:11', port: 'eth0', bridge: null, seen: 2 } ] });
 	assert.deepEqual(n.wiredHosts.map(h => [ h.mac, h.approx ]), [ [ '00:00:5e:00:53:11', false ] ]);
+});
+
+/* the plugin's ARP fallback: no bridge entry, but the ARP table's own
+   address, and the interface it answers on is a bridge member */
+test('build: an approximate host keeps the ARP table address and finds its bridge', () => {
+	const ifaces = [
+		{ interface: 'wan', up: true, l3_device: 'pppoe-wan', device: 'eth0', 'ipv4-address': [ { address: '203.0.113.2', mask: 24 } ],
+			route: [ { target: '0.0.0.0', mask: 0, nexthop: '203.0.113.1' } ] },
+		{ interface: 'lan', up: true, l3_device: 'br-lan', device: 'br-lan', 'ipv4-address': [ { address: '192.0.2.1', mask: 24 } ] }
+	];
+	const devs = {
+		'br-lan': { type: 'bridge', devtype: 'bridge', 'bridge-members': [ 'eth1' ] },
+		eth1: { devtype: 'ethernet', carrier: true, speed: '1000F' },
+		'pppoe-wan': { devtype: 'ethernet' }
+	};
+	const m = model.build({ ifaces, devs, hints: {}, fdb: [
+		{ mac: '02:00:5e:00:53:77', port: 'eth1', bridge: null, vlan: null, seen: null, ip: '192.0.2.77', approx: true }
+	] });
+	const h = m.wiredHosts[0];
+	assert.deepEqual([ h.port, h.bridge, h.network, h.approx ], [ 'eth1', 'br-lan', 'lan', true ], 'the bridge found by membership');
+	assert.deepEqual(h.ips, [ '192.0.2.77' ], 'the address from the ARP table, though no hint knows it');
+	assert.equal(h.seen, null);
+	assert.equal(h.speed, null, 'an interface link is not claimed as the host\'s');
+});
+
+test('build: a tunnel is a network, and its peers stand under it', () => {
+	const m = model.build({
+		ifaces: [
+			{ interface: 'lan', up: true, l3_device: 'eth0', device: 'eth0', 'ipv4-address': [ { address: '192.0.2.1', mask: 24 } ] },
+			{ interface: 'awg0', up: true, proto: 'amneziawg', l3_device: 'awg0', device: 'awg0', 'ipv4-address': [ { address: '198.51.100.1', mask: 24 } ] }
+		],
+		devs: { eth0: { devtype: 'ethernet' }, awg0: { devtype: 'tunnel' } },
+		vpn: { awg0: [ { desc: 'phone', ips: [ '198.51.100.2/32' ] }, { desc: null, ips: [ '198.51.100.3/32', '2001:db8::3/128' ] } ] },
+		fdb: []
+	});
+	const n = m.networks.filter(x => x.name === 'awg0')[0];
+	assert.equal(n.proto, 'amneziawg');
+	assert.deepEqual(n.peers, [
+		{ name: 'phone', ips: [ '198.51.100.2/32' ] },
+		{ name: null, ips: [ '198.51.100.3/32', '2001:db8::3/128' ] }
+	], 'each peer with the addresses it holds inside the tunnel');
+	assert.deepEqual(model.build({ ifaces: m.networks.length ? undefined : [] }).networks, [], 'no ifaces, no networks');
 });

@@ -29,6 +29,11 @@ function arr(v) { return Array.isArray(v) ? v : []; }
    any further one stays a network */
 var MAX_LINES = 4;
 
+/* WireGuard and AmneziaWG peers listed under their interface, and the
+   addresses spelled out for each: a peer is one node on the path */
+var MAX_PEERS = 64;
+var MAX_PEER_IPS = 4;
+
 /* netifd protocols, and kernel device types, of tunnels that ride over
    another line: a full-tunnel VPN is not a second way out. PPTP and L2TP
    are left out: some ISPs give their access through them. */
@@ -503,7 +508,7 @@ return baseclass.extend({
 	   device) and the full-tunnel VPN drawn on the main one. One entry
 	   per device, by interface name.
 	   -> [ { name, proto, dev, up, ipv4 } ] */
-	networks: function(ifaces, uplinks) {
+	networks: function(ifaces, uplinks, vpn) {
 		var seen = Object.create(null);
 		uplinks = arr(Array.isArray(uplinks) ? uplinks : [ uplinks ]).filter(Boolean);
 		return arr(ifaces).filter(function(i) {
@@ -513,12 +518,23 @@ return baseclass.extend({
 		}).map(function(i) {
 			var dev = i.l3_device || i.device;
 			var a4 = arr(i['ipv4-address']).filter(function(a) { return a && a.address; })[0];
+			/* a tunnel's peers stand under it: they have no MAC, so they are
+			   not clients, only the far ends the configuration names */
+			var peers = arr(vpn && vpn[String(i.interface)]).filter(function(p) {
+				return p && arr(p.ips).length;
+			}).slice(0, MAX_PEERS).map(function(p) {
+				return {
+					name: (typeof p.desc === 'string' && p.desc) ? fmt.safeText(p.desc, 32) : null,
+					ips: arr(p.ips).filter(function(a) { return typeof a === 'string'; }).slice(0, MAX_PEER_IPS).map(function(a) { return fmt.safeText(a, 48); })
+				};
+			});
 			return {
 				name: fmt.safeText(i.interface, 32),
 				proto: typeof i.proto === 'string' ? fmt.safeText(i.proto, 24) : null,
 				dev: typeof dev === 'string' && dev ? dev : null,
 				up: !!i.up,
-				ipv4: a4 ? a4.address + '/' + a4.mask : null
+				ipv4: a4 ? a4.address + '/' + a4.mask : null,
+				peers: peers
 			};
 		}).filter(function(n) {
 			if (uplinks.some(function(u) {
@@ -606,6 +622,7 @@ return baseclass.extend({
 	          assoc: { ifname: [ station ] }, hapd: { ifname: { clients } },
 	          hapdStatus: { ifname: status }, hints, aliases, rdns, mdns,
 	          fdb: [ luci.vantage wired host ] (-> wiredHosts),
+	          vpn: { iface: [ { desc, ips } ] } (-> networks[].peers),
 	          routes: [ luci.vantage routes route ] or null,
 	          vendor: fn(mac) -> name|null } */
 	build: function(raw) {
@@ -744,7 +761,8 @@ return baseclass.extend({
 			var seen = finite(h.seen) && h.seen >= 0 ? h.seen : null, prev = fdb[mac];
 			if (prev && (seen == null || (prev.seen != null && prev.seen <= seen))) return;
 			if (!prev) wiredMacs.push(mac);
-			fdb[mac] = { port: h.port, bridge: typeof h.bridge === 'string' ? h.bridge : null, vlan: finite(h.vlan) ? h.vlan : null, seen: seen };
+			fdb[mac] = { port: h.port, bridge: typeof h.bridge === 'string' ? h.bridge : null, vlan: finite(h.vlan) ? h.vlan : null, seen: seen,
+				approx: h.approx === true, ip: typeof h.ip === 'string' ? h.ip : null };
 		});
 		/* a gateway, by the address the host hints give it; on a bridge
 		   with several ports a line is the port it was learned on */
@@ -810,6 +828,17 @@ return baseclass.extend({
 				fdb[mac] = { port: lanDevs[0], bridge: lanDevs[0], vlan: null, seen: null, approx: true };
 			});
 		}
+		/* an ARP entry names the interface a host answers on, not the bridge
+		   that interface is a member of: look it up among the members, so
+		   the host gets its bridge's network and subnets like a learned one */
+		wiredMacs.forEach(function(mac) {
+			var h = fdb[mac];
+			if (!h.approx || h.bridge || !h.port) return;
+			Object.keys(devs).forEach(function(b) {
+				var dv = obj(devs[b]);
+				if (!h.bridge && dv.type === 'bridge' && arr(dv['bridge-members']).indexOf(h.port) >= 0) h.bridge = b;
+			});
+		});
 		wiredMacs.forEach(function(mac) { everyone.push({ mac: mac, ips: self.hintAddrs(hintOf(mac), wiredSubnets(mac)) }); });
 		var mdns = names.mdnsForStations(raw.mdns, everyone);
 
@@ -887,6 +916,10 @@ return baseclass.extend({
 		wiredMacs.forEach(function(mac) { var p = fdb[mac].port; perPort[p] = (perPort[p] || 0) + 1; });
 		var wired = wiredMacs.map(function(mac) {
 			var h = fdb[mac], d = devs[h.port], hint = hintOf(mac), ips = self.hintAddrs(hint, wiredSubnets(mac));
+			/* the ARP table's own address: the host hints carry leases and
+			   announcements only, so a device on a static address is in
+			   neither and would otherwise be listed without one */
+			if (h.ip && !ips.some(function(a) { return a.indexOf(':') < 0; })) ips = [ h.ip ].concat(ips);
 			/* behind a switch VLAN the port's own link is the CPU's: the
 			   host's is a switch port's, known when only one has a link */
 			var sw = self.switchOf(raw.switches, raw.switchState, h.port);
@@ -948,7 +981,7 @@ return baseclass.extend({
 			/* the main line first, then up to MAX_LINES others to the
 			   internet; networks leaves out only these */
 			uplinks: uplinks,
-			networks: this.networks(raw.ifaces, uplinks),
+			networks: this.networks(raw.ifaces, uplinks, raw.vpn),
 			radios: radios,
 			ssids: ssids,
 			clients: clients,

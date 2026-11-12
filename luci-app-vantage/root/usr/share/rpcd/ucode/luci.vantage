@@ -48,6 +48,11 @@
 //              when a lookup could not be sent. One lookup a family, so
 //              the work does not grow with the routing table. Read group
 //              luci-app-vantage.
+//   vpn        the peers of the WireGuard and AmneziaWG interfaces, by
+//              interface name: each peer's allowed addresses (the address
+//              it holds inside the tunnel) and its description, from the
+//              network config only. No key, nothing written. Read group
+//              luci-app-vantage.
 //   set_alias  { mac, name, icon }: name one station, or remove its name
 //              with name ''. Validated here, whatever the browser did, and
 //              written to /etc/config/vantage only. Write group
@@ -119,6 +124,12 @@ const RE_VLAN_DEV = /^[A-Za-z0-9_-]{1,10}\.([0-9]{1,4})$/;  // 'eth1.1'
 /* /proc/net/arp: address, HW type, flags, HW address, mask, device */
 const RE_ARP = /^(\S+)\s+\S+\s+(0x[0-9a-f]{1,8})\s+(\S+)\s+\S+\s+(\S+)/;
 const RE_WAN_DEV = /^(wan|ppp|pppoe|wwan)/;   // a peer beyond these is not a client
+const RE_IPV4 = /^[0-9]{1,3}(\.[0-9]{1,3}){3}$/;
+/* peer sections: config amneziawg_awg0 / wireguard_wg0 -> interface awg0 */
+const RE_VPN_SECTION = /^(amneziawg|wireguard)_([A-Za-z0-9_.-]{1,15})$/;
+const RE_CIDR = /^[0-9a-fA-F:.]{2,45}\/[0-9]{1,3}$/;
+const MAX_PEERS = 64;
+const MAX_PEER_IPS = 4;
 
 /* ------------------------------------------------------------ helpers */
 
@@ -626,8 +637,55 @@ function arp_hosts() {
 		if (!mac || !dev || is_multicast(mac) || match(dev, RE_WAN_DEV))
 			continue;
 
-		push(out, { mac, port: dev, bridge: null, vlan: null, seen: null, approx: true });
+		push(out, { mac, port: dev, bridge: null, vlan: null, seen: null,
+			ip: match(f[1], RE_IPV4) ? f[1] : null, approx: true });
 	}
+
+	return out;
+}
+
+// The peers of the WireGuard and AmneziaWG interfaces, by interface name:
+// one entry per peer section (`config amneziawg_awg0`, `config
+// wireguard_wg0`) with the addresses it holds inside the tunnel, which are
+// its allowed_ips, and its description. A peer has no MAC and no ARP entry,
+// so it is not one of the hosts: the dashboard draws it under its interface.
+// Configuration is read; no key, and nothing written. Read group
+// luci-app-vantage.
+function vpn() {
+	let out = {}, cur = cursor();
+
+	if (!cur.load(NETWORK))
+		return out;
+
+	cur.foreach(NETWORK, (s) => {
+		let m = (type(s['.type']) == 'string') ? match(s['.type'], RE_VPN_SECTION) : null;
+
+		if (!m || s.disabled === '1')
+			return;
+
+		let iface = m[2], peers = out[iface] ?? [];
+
+		if (length(peers) >= MAX_PEERS)
+			return;
+
+		let ips = [], list = (type(s.allowed_ips) == 'array') ? s.allowed_ips : [ s.allowed_ips ];
+
+		for (let a in list) {
+			if (type(a) == 'string' && match(trim(a), RE_CIDR) && length(ips) < MAX_PEER_IPS)
+				push(ips, trim(a));
+		}
+
+		/* a peer with no allowed address has nothing the dashboard can show */
+		if (!length(ips))
+			return;
+
+		push(peers, {
+			desc: (type(s.description) == 'string' && length(s.description) <= 64) ? s.description : null,
+			ips
+		});
+
+		out[iface] = peers;
+	});
 
 	return out;
 }
@@ -882,6 +940,12 @@ const methods = {
 	routes: {
 		call: function() {
 			return { routes: routes() };
+		}
+	},
+
+	vpn: {
+		call: function() {
+			return { peers: vpn() };
 		}
 	},
 

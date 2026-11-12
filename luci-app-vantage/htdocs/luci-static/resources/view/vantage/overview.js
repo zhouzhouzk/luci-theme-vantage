@@ -90,6 +90,8 @@ var callWired = rpc.declare({ object: 'luci.vantage', method: 'wired', expect: {
 /* the route the kernel takes to the internet: which one it kept of two
    with one metric; { routes: null } when it could not be asked */
 var callRoutes = rpc.declare({ object: 'luci.vantage', method: 'routes', expect: { '': {} } });
+/* { peers: { iface: [ { desc, ips } ] } }: WireGuard and AmneziaWG peers */
+var callVpn = rpc.declare({ object: 'luci.vantage', method: 'vpn', expect: { '': {} } });
 /* LuCI's own (its switch page's): link and speed of a switch's ports, in
    result. The whole reply, and a failed call rejected: a default [] would
    read as every port down */
@@ -805,7 +807,8 @@ return view.extend({
 			slow ? L.resolveDefault(callThermal(), null) : Promise.resolve(kept.thermal),
 			slow ? L.resolveDefault(callWired().catch(function(e) { fdbError = e; return null; }), null) : Promise.resolve(kept.wired),
 			/* null when the call fails (an older plugin): netifd's metrics decide */
-			L.resolveDefault(callRoutes(), null)
+			L.resolveDefault(callRoutes(), null),
+			L.resolveDefault(callVpn(), null)
 		]).then(function(r) {
 			var wifiDevs = (r[4] && typeof r[4] === 'object') ? r[4] : null;
 			var wiredReply = (r[7] && typeof r[7] === 'object') ? r[7] : {};
@@ -943,6 +946,7 @@ return view.extend({
 					/* no answer (an older plugin, a lookup not sent, a failed call)
 					   keeps the last one: no tunnel blinking off */
 					routes: r[8] && Array.isArray(r[8].routes) ? (self.kernelRoutes = r[8].routes) : (self.kernelRoutes || null),
+					vpn: (r[9] && typeof r[9] === 'object' && r[9].peers && typeof r[9].peers === 'object') ? r[9].peers : {},
 					assoc: assoc, hapd: hapd, hapdStatus: hapdStatus, iwinfo: iwinfo, survey: survey, at: Date.now(), started: started };
 			});
 		});
@@ -2380,11 +2384,13 @@ return view.extend({
 		h.lines.forEach(function(ln) { h.watch.push(ln.el); });
 		if (m.wired) {
 			m.networks.filter(function(n) { return n.up; }).slice(0, 8).forEach(function(n) {
-				var b = { id: n.name, ssids: [], kicker: span('vt-node-kicker'), title: span('vt-node-title'), addr: span('vt-node-sub vt-mono'), sub: span('vt-node-sub vt-tn') };
+				var b = { id: n.name, ssids: [], peerSig: '', kicker: span('vt-node-kicker'), title: span('vt-node-title'), addr: span('vt-node-sub vt-mono'), sub: span('vt-node-sub vt-tn') };
 				b.el = E('a', { 'class': 'vt-node vt-node-radio vt-node-net', 'href': L.url.apply(L, insight.PAGES.network) }, [
 					E('span', { 'class': 'vt-node-body' }, [ b.kicker, b.title, b.addr, b.sub ])
 				]);
-				b.wrap = E('div', { 'class': 'vt-branch' }, [ b.el ]);
+				/* a tunnel's peers: its far ends, listed beside it */
+				b.col = E('div', { 'class': 'vt-branch-ssids' });
+				b.wrap = E('div', { 'class': 'vt-branch' }, [ b.el, b.col ]);
 				h.radios.push(b);
 			});
 			if (!h.radios.length) h.branches.appendChild(E('div', { 'class': 'vt-empty-inline' }, [ _('No other interfaces are up') ]));
@@ -2515,6 +2521,21 @@ return view.extend({
 				txt(b.sub, r ? fmt.rates(r.tx, r.rx) : fmt.DASH);
 				b.active = !!(r && r.rx + r.tx > 50e3);
 				b.rate = r ? r.rx + r.tx : 0;
+				/* the tunnel's peers, rebuilt when one joins, leaves or is renamed */
+				var peers = Array.isArray(n.peers) ? n.peers : [];
+				var psig = peers.map(function(p) { return (p.name || '') + '|' + (Array.isArray(p.ips) ? p.ips : []).join(','); }).join(';');
+				if (b.col && psig !== b.peerSig) {
+					b.peerSig = psig;
+					dom.content(b.col, peers.map(function(p) {
+						var ips = Array.isArray(p.ips) ? p.ips : [], bare = (ips[0] || '').split('/')[0];
+						return E('div', { 'class': 'vt-node vt-node-ssid', 'title': ips.join(' · ') }, [
+							E('span', { 'class': 'vt-node-body' }, [
+								E('span', { 'class': 'vt-node-title vt-ssid-name' }, [ p.name || bare || fmt.DASH ]),
+								E('span', { 'class': 'vt-node-sub vt-tn' }, [ p.name ? bare : '' ])
+							])
+						]);
+					}));
+				}
 			});
 			return;
 		}
@@ -3521,7 +3542,7 @@ return view.extend({
 					E('span', { 'class': 'vt-live-split vt-tn', 'title': r ? _('To device %s, from device %s').format(fmt.bits(r.tx), fmt.bits(r.rx)) : '' }, [ r ? fmt.rates(r.tx, r.rx) : '' ])
 				])
 			]),
-			E('td', { 'class': 'vt-td-seen vt-tn', 'data-title': _('Last heard') }, [ c.seen == null ? _('static entry') : fmt.ago(c.seen * 1000) ])
+			E('td', { 'class': 'vt-td-seen vt-tn', 'data-title': _('Last heard') }, [ c.seen == null ? (c.approx ? fmt.DASH : _('static entry')) : fmt.ago(c.seen * 1000) ])
 		];
 	},
 
