@@ -567,6 +567,10 @@ let fdb_le = null;
 let ct_hosts = null;
 let ct_at = 0;
 
+// the connection tracker's bytes per address, and when they were read
+let ctb_val = null;
+let ctb_at = 0;
+
 // The bridges' sysfs brforward tables: FDB_ENTRY-byte records (MAC, port
 // number, is_local, ageing in 1/100 s, the port number's high byte),
 // and the kernel fills only as many as asked for, so no more than the
@@ -692,6 +696,106 @@ function lease_names() {
 
 		if (mac && length(f[3]) <= 64)
 			out[mac] = f[3];
+	}
+
+	return out;
+}
+
+// Whether an address is on a private network: the LAN side of a flow, which
+// is the only side a client can be. Same ranges as luci-app-netview.
+function is_private(ip) {
+	if (match(ip, /^10\./) || match(ip, /^192\.168\./))
+		return true;
+
+	let m = match(ip, /^172\.([0-9]{1,2})\./);
+
+	return m && +m[1] >= 16 && +m[1] <= 31;
+}
+
+// Bytes moved by each address through this device, from the connection
+// tracker: { ip: { up, down, conns } }, up = sent by the device, down =
+// received. This is the only traffic figure a host behind a bridged access
+// point can have: its link belongs to a radio this device does not own, so
+// no counter of ours includes it, but every forwarded byte passes here.
+// The device's own addresses are left out, so the router is never a client.
+// Read group luci-app-vantage.
+function ct_bytes() {
+	let out = {}, own = {}, kept = 0, added = 0;
+
+	// the addresses this device holds, from the source the page draws from
+	try {
+		let dump = connect()?.call('network.interface', 'dump', {});
+
+		for (let i in ((dump && type(dump.interface) == 'array') ? dump.interface : [])) {
+			for (let a in (type(i['ipv4-address']) == 'array' ? i['ipv4-address'] : [])) {
+				if (type(a) == 'object' && type(a.address) == 'string')
+					own[a.address] = 1;
+			}
+		}
+	} catch (e) { }
+
+	let text = null;
+
+	for (let f in CT_FILES) {
+		text = readfile(f, CT_MAX);
+
+		if (type(text) == 'string')
+			break;
+	}
+
+	if (type(text) != 'string')
+		return out;
+
+	for (let line in split(text, '\n')) {
+		if (++kept > CT_LINES)
+			break;
+
+		if (!match(line, /src=/))
+			continue;
+
+		/* the first src/dst pair is the starting direction, the second the
+		   reply, each followed by its own byte count */
+		let s1 = null, d1 = null, b1 = 0, b2 = 0, seen = 0, nb = 0;
+
+		for (let tok in split(line, ' ')) {
+			if (match(tok, /^src=/)) {
+				if (++seen == 1)
+					s1 = substr(tok, 4);
+			}
+			else if (match(tok, /^dst=/)) {
+				if (seen == 1 && d1 == null)
+					d1 = substr(tok, 4);
+			}
+			else if (match(tok, /^bytes=/)) {
+				let v = int(substr(tok, 6));
+
+				if (++nb == 1)
+					b1 = v;
+				else if (nb == 2)
+					b2 = v;
+			}
+		}
+
+		if (s1 != null && is_private(s1) && !own[s1]) {
+			if (out[s1] == null && ++added > MAX_HOSTS)
+				break;
+
+			let e = out[s1] ?? { up: 0, down: 0, conns: 0 };
+			e.up += b1;
+			e.down += b2;
+			e.conns++;
+			out[s1] = e;
+		}
+		else if (d1 != null && is_private(d1) && !own[d1]) {
+			if (out[d1] == null && ++added > MAX_HOSTS)
+				break;
+
+			let e = out[d1] ?? { up: 0, down: 0, conns: 0 };
+			e.up += b2;
+			e.down += b1;
+			e.conns++;
+			out[d1] = e;
+		}
 	}
 
 	return out;
@@ -1222,6 +1326,21 @@ const methods = {
 	vpn: {
 		call: function() {
 			return vpn();
+		}
+	},
+
+	ct: {
+		call: function() {
+			let now = clock(true)?.[0] ?? 0;
+
+			/* the poll comes every 5 s: one reading serves it, and a page
+			   with two tabs does not double the work */
+			if (ctb_val == null || now - ctb_at >= CT_TTL / 5) {
+				ctb_val = ct_bytes();
+				ctb_at = now;
+			}
+
+			return { addrs: ctb_val };
 		}
 	},
 

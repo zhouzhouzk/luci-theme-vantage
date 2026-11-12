@@ -1060,3 +1060,15 @@ test('build: a host named by the lease the plugin read', () => {
 	});
 	assert.equal(n.wiredHosts[0].name, 'appletv');
 });
+
+/* the connection tracker's per-address counters go through the same
+   differ as every other counter: the first reading is a baseline */
+test('rates: per-address counters from the connection tracker', () => {
+	const first = model.rates(null, { '192.0.2.9': { rx: 1000, tx: 2000 } }, 1000);
+	assert.deepEqual(Object.keys(first.rates), [], 'a first reading has nothing to compare');
+	const next = model.rates(first.next, { '192.0.2.9': { rx: 3000, tx: 2000 } }, 3000);
+	assert.equal(next.rates['192.0.2.9'].rx, 8000, '2000 bytes over 2 s, in bits');
+	assert.equal(next.rates['192.0.2.9'].tx, 0);
+	/* a connection closing takes its bytes with it: no invented negative rate */
+	assert.deepEqual(Object.keys(model.rates(next.next, { '192.0.2.9': { rx: 100, tx: 0 } }, 5000).rates), []);
+});

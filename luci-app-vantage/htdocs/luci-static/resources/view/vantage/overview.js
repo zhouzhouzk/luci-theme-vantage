@@ -92,6 +92,9 @@ var callWired = rpc.declare({ object: 'luci.vantage', method: 'wired', expect: {
 var callRoutes = rpc.declare({ object: 'luci.vantage', method: 'routes', expect: { '': {} } });
 /* { peers: { iface: [ { desc, ips } ] } }: WireGuard and AmneziaWG peers */
 var callVpn = rpc.declare({ object: 'luci.vantage', method: 'vpn', expect: { '': {} } });
+/* { addrs: { ip: { up, down, conns } } }: bytes per address, so a host
+   behind a bridged access point has a traffic figure of its own */
+var callCt = rpc.declare({ object: 'luci.vantage', method: 'ct', expect: { '': {} } });
 /* LuCI's own (its switch page's): link and speed of a switch's ports, in
    result. The whole reply, and a failed call rejected: a default [] would
    read as every port down */
@@ -810,7 +813,8 @@ return view.extend({
 			slow ? L.resolveDefault(callWired().catch(function(e) { fdbError = e; return null; }), null) : Promise.resolve(kept.wired),
 			/* null when the call fails (an older plugin): netifd's metrics decide */
 			L.resolveDefault(callRoutes(), null),
-			L.resolveDefault(callVpn().catch(function(e) { vpnError = e; return null; }), null)
+			L.resolveDefault(callVpn().catch(function(e) { vpnError = e; return null; }), null),
+			L.resolveDefault(callCt(), null)
 		]).then(function(r) {
 			var wifiDevs = (r[4] && typeof r[4] === 'object') ? r[4] : null;
 			var wiredReply = (r[7] && typeof r[7] === 'object') ? r[7] : {};
@@ -951,6 +955,7 @@ return view.extend({
 					vpn: (r[9] && typeof r[9] === 'object' && r[9].peers && typeof r[9].peers === 'object') ? r[9].peers : {},
 					vpnError: vpnError ? String((vpnError && (vpnError.message || vpnError.status || vpnError)) || '') : null,
 					vpnDebug: (r[9] && typeof r[9] === 'object' && r[9].debug && typeof r[9].debug === 'object') ? r[9].debug : null,
+					ct: (r[10] && typeof r[10] === 'object' && r[10].addrs && typeof r[10].addrs === 'object') ? r[10].addrs : {},
 					assoc: assoc, hapd: hapd, hapdStatus: hapdStatus, iwinfo: iwinfo, survey: survey, at: Date.now(), started: started };
 			});
 		});
@@ -979,6 +984,7 @@ return view.extend({
 		this.st = {
 			clock: null, stat: null, cpu: held, cores: held ? held.cores.length : null, cpuMeasured: false,
 			devPrev: null, staPrev: null, devRates: Object.create(null), staRates: Object.create(null), radioRates: Object.create(null), ssidRates: Object.create(null),
+			ctPrev: null, ctRates: Object.create(null),
 			hist: { net: net, cpu: series.valid(stored.cpu, 2, HIST_FAST, now), mem: series.valid(stored.mem, 2, HIST_MAX, now) },
 			clientHist: clientHist, bestStd: Object.create(null),
 			presence: null, isNew: Object.create(null), gone: [],
@@ -1057,6 +1063,19 @@ return view.extend({
 		});
 		var dr = model.rates(st.devPrev, devCounters, at);
 		st.devPrev = dr.next;
+
+		/* per address, from the connection tracker: the only rate a host
+		   behind a bridged access point can have */
+		var ctCounters = Object.create(null);
+		Object.keys(raw.ct || {}).forEach(function(ip) {
+			var e = raw.ct[ip];
+			if (e && typeof e.up === 'number' && typeof e.down === 'number') ctCounters[ip] = { rx: e.up, tx: e.down };
+		});
+		if (Object.keys(ctCounters).length) {
+			var cr = model.rates(st.ctPrev, ctCounters, at);
+			st.ctPrev = cr.next;
+			st.ctRates = cr.rates;
+		}
 		if (Object.keys(dr.rates).length || !Object.keys(devCounters).length) st.devRates = dr.rates;
 
 		function sum(list) {
@@ -3301,6 +3320,19 @@ return view.extend({
 		return c.shared ? null : this.st.devRates[c.port] || null;
 	},
 
+	/* A host behind a shared port has no counter of ours: its frames belong
+	   to a port it shares with a whole access point. The connection tracker
+	   still knows what it moved through this device, so the host gets a
+	   figure of its own -- after traffic, which is when it means anything. */
+	hostRate: function(c) {
+		var st = this.st, ips = Array.isArray(c.ips) ? c.ips : [];
+		for (var i = 0; i < ips.length; i++) {
+			var r = st.ctRates[ips[i]];
+			if (r && (r.rx > 0 || r.tx > 0)) return r;
+		}
+		return null;
+	},
+
 	sortValue: function(c, key) {
 		var r = typeof c.port === 'string' ? this.portRate(c) : this.st.staRates[c.mac];
 		switch (key) {
@@ -3452,7 +3484,7 @@ return view.extend({
 		if (ui.chip === 'new') gone = [];
 
 		var maxRate = 0;
-		all.forEach(function(c) { var r = wired ? self.portRate(c) : st.staRates[c.mac]; if (r && r.rx + r.tx > maxRate) maxRate = r.rx + r.tx; });
+		all.forEach(function(c) { var r = wired ? (self.portRate(c) || self.hostRate(c)) : st.staRates[c.mac]; if (r && r.rx + r.tx > maxRate) maxRate = r.rx + r.tx; });
 
 		var keep = new Set(), at = 0;
 		this.rowSig = this.rowSig || new Map();
@@ -3535,7 +3567,7 @@ return view.extend({
 	   itself; on a shared port (a switch or another access point behind
 	   it) neither the speed nor the traffic is its own */
 	wiredCells: function(c, maxRate) {
-		var r = this.portRate(c), total = r ? r.rx + r.tx : 0;
+		var r = this.portRate(c) || this.hostRate(c), total = r ? r.rx + r.tx : 0;
 		var bar = E('span', { 'class': 'vt-mini-fill' });
 		setW(bar, maxRate > 0 ? total / maxRate * 100 : 0);
 		var tags = [];
@@ -3554,13 +3586,15 @@ return view.extend({
 			this.whoCell(c, tags),
 			link,
 			E('td', { 'class': 'vt-td-net', 'data-title': _('Network') }, [ E('div', { 'class': 'vt-net' }, [ E('span', { 'class': 'vt-net-ssid' }, [ c.network || c.bridge || fmt.DASH ]) ]) ]),
-			E('td', { 'class': 'vt-td-live', 'data-title': _('Live') }, c.shared ? [
+			E('td', { 'class': 'vt-td-live', 'data-title': _('Live') }, (c.shared && !r) ? [
 				E('span', { 'class': 'vt-muted', 'title': _('Not counted per device on a shared port') }, [ fmt.DASH ])
 			] : [
 				E('div', { 'class': 'vt-live-cell' }, [
 					E('span', { 'class': 'vt-tn vt-live-total' }, [ r ? fmt.bits(total) : fmt.DASH ]),
 					E('span', { 'class': 'vt-mini' }, [ bar ]),
-					E('span', { 'class': 'vt-live-split vt-tn', 'title': r ? _('To device %s, from device %s').format(fmt.bits(r.tx), fmt.bits(r.rx)) : '' }, [ r ? fmt.rates(r.tx, r.rx) : '' ])
+					E('span', { 'class': 'vt-live-split vt-tn', 'title': !r ? '' : c.shared
+						? _('Through this device, from the connection tracker: to device %s, from device %s').format(fmt.bits(r.tx), fmt.bits(r.rx))
+						: _('To device %s, from device %s').format(fmt.bits(r.tx), fmt.bits(r.rx)) }, [ r ? fmt.rates(r.tx, r.rx) : '' ])
 				])
 			]),
 			E('td', { 'class': 'vt-td-seen vt-tn', 'data-title': _('Last heard') }, [ c.seen == null ? (c.approx ? fmt.DASH : _('static entry')) : fmt.ago(c.seen * 1000) ])
@@ -3884,7 +3918,8 @@ return view.extend({
 	},
 
 	drawerWired: function(c) {
-		var self = this, r = this.portRate(c), shared = c.shared ? this.st.devRates[c.port] : null;
+		var self = this, host = c.shared ? this.hostRate(c) : null, r = this.portRate(c) || host,
+			shared = c.shared ? this.st.devRates[c.port] : null;
 		var title = this.drawerWho(c);
 		var rename = this.canWrite ? E('button', { 'type': 'button', 'class': 'vt-btn vt-btn-ghost', 'click': function() { self.startRename(c); } }, [ icon('pencil'), E('span', {}, [ c.alias ? _('Rename', 'vantage') : _('Name this device') ]) ]) : '';
 		var speed = c.speed ? model.speedLabel(c.speed) : fmt.DASH;
@@ -3897,7 +3932,10 @@ return view.extend({
 					E('small', {}, [ c.switch ? _('behind %s, VLAN %d').format(c.switch.name, c.switch.vlan) : _('the port: %s').format(speed) ]) ]
 					: c.switchPort ? [ speed, E('small', {}, [ _('switch port %s').format(c.switchPort) ]) ] : speed),
 				c.switch ? kv(_('Switch ports'), switchLines(c.switch).map(function(l) { return E('div', {}, [ l ]); })) : '',
-				kv(_('Traffic'), c.shared ? [
+				kv(_('Traffic'), host ? [
+					'↓ ' + fmt.bits(host.tx) + ' · ↑ ' + fmt.bits(host.rx),
+					E('small', {}, [ _('through this device, from the connection tracker') ])
+				] : c.shared ? [
 					E('span', { 'class': 'vt-muted' }, [ _('Not counted per device on a shared port') ]),
 					shared ? E('small', {}, [ _('the port in total: %s').format('↓ ' + fmt.bits(shared.tx) + ' · ↑ ' + fmt.bits(shared.rx)) ]) : ''
 				] : r ?'↓ ' + fmt.bits(r.tx) + ' · ↑ ' + fmt.bits(r.rx) : _('measuring')),
