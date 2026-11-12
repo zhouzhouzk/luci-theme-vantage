@@ -2562,17 +2562,18 @@ return view.extend({
 					/* a tunnel with nothing under it: say why, so an empty
 					   node is not mistaken for a broken page */
 					if (!rows.length && /^(amneziawg|wireguard)$/i.test(String(n.proto || ''))) {
-						var note = E('span', { 'class': 'vt-empty-inline' }, [ vErr ? _('Peers unavailable: log out and back in') : _('No peers seen') ]);
-
-						/* what the call saw, on hover: an empty node is either no
-						   tunnel found, no peer section, or no flow to learn from */
+						/* what the call saw, in the line itself: an empty node is
+						   either no tunnel found, no peer section, or no flow */
 						var vd = self.lastRaw && self.lastRaw.vpnDebug;
-						if (vd && !vErr)
-							setTitle(note, _('Tunnels: %s · peer sections: %d · flows: %d').format(
-								(Array.isArray(vd.tunnels) ? vd.tunnels.join('; ') : '') || fmt.DASH,
-								Number(vd.sections) || 0, Number(vd.ct) || 0));
+						var why = vd ? ' · t:%d s:%d f:%d'.format(
+							Array.isArray(vd.tunnels) ? vd.tunnels.length : 0,
+							Number(vd.sections) || 0, Number(vd.ct) || 0) : '';
 
-						rows.push(note);
+						rows.push(E('span', { 'class': 'vt-empty-inline', 'title':
+							vd ? _('Tunnels: %s · peer sections: %d · flows: %d').format(
+								(Array.isArray(vd.tunnels) ? vd.tunnels.join('; ') : '') || fmt.DASH,
+								Number(vd.sections) || 0, Number(vd.ct) || 0) : '' },
+							[ vErr ? _('Peers unavailable: log out and back in') : _('No peers seen') + why ]));
 					}
 					dom.content(b.col, rows);
 				}

@@ -139,6 +139,9 @@ const RE_VPN_SECTION = /^(amneziawg|wireguard)_([A-Za-z0-9_.-]{1,15})$/;
 const RE_CIDR = /^[0-9a-fA-F:.]{2,45}\/[0-9]{1,3}$/;
 const MAX_PEERS = 64;
 const MAX_PEER_IPS = 4;
+/* where a peer's allowed_ips may live: the AmneziaWG and WireGuard apps
+   keep them in network, some keep them in a config of their own */
+const VPN_CONFIGS = [ 'network', 'amneziawg', 'wireguard' ];
 
 /* ------------------------------------------------------------ helpers */
 
@@ -853,46 +856,12 @@ function arp_hosts() {
 // Configuration and /proc are read; no key, nothing written. Read group
 // luci-app-vantage.
 function vpn() {
-	let out = {}, seen = {}, tunnels = {}, tun_seen = {}, cur = cursor();
-	/* what the call saw, for a dashboard that shows nothing: which tunnel
-	   interfaces it found, how many peer sections, how many addresses the
-	   connection tracker gave, and how many peers came out */
+	let out = {}, seen = {}, tunnels = {}, tun_seen = {}, order = {};
 	let dbg = { tunnels: [], sections: 0, ct: 0, peers: 0 };
 
-	if (!cur.load(NETWORK))
-		return { peers: out, debug: dbg };
-
-	// The tunnel interfaces first, with the subnets their peers live in:
-	// that is what tells a peer from a LAN client when the connection
-	// tracker names no interface.
-	cur.foreach(NETWORK, 'interface', (s) => {
-		if (s.proto != 'amneziawg' && s.proto != 'wireguard')
-			return;
-
-		let nets = [], own = {}, list = (type(s.addresses) == 'array') ? s.addresses : [ s.addresses ];
-
-		for (let a in list) {
-			let m = (type(a) == 'string') ? match(trim(a), RE_NET) : null;
-
-			if (!m)
-				continue;
-
-			let n = ip4num(m[1]), bits = +m[3];
-
-			if (n != null && bits >= 0 && bits <= 32) {
-				push(nets, { base: n, bits, text: m[1] + '/' + bits });
-				own[m[1]] = 1;
-			}
-		}
-
-		tunnels[s['.name']] = { nets, own };
-		tun_seen[s['.name']] = 1;
-		push(dbg.tunnels, s['.name'] + ' ' + s.proto + ' ' + join(',', map(nets, (n) => n.text)));
-	});
-
-	// The interfaces the dashboard itself draws, from netifd's dump: the
-	// page's network nodes come from here, so a node it shows is a tunnel
-	// this call knows about, whatever the configuration calls it.
+	// The tunnels the page draws, from netifd's dump: an interface it shows
+	// as amneziawg or wireguard is one this call knows, whatever the
+	// configuration calls it, plus the subnets its peers live in.
 	try {
 		let dump = connect()?.call('network.interface', 'dump', {});
 
@@ -900,7 +869,7 @@ function vpn() {
 			if (type(i) != 'object' || (i.proto != 'amneziawg' && i.proto != 'wireguard'))
 				continue;
 
-			let t = tunnels[i.interface] ?? { nets: [], own: {} };
+			let t = { nets: [], own: {} };
 
 			for (let a in (type(i['ipv4-address']) == 'array' ? i['ipv4-address'] : [])) {
 				let m = (type(a) == 'object') ? match((a.address ?? '') + '/' + (a.mask ?? 32), RE_NET) : null;
@@ -917,82 +886,67 @@ function vpn() {
 				t.own[m[1]] = 1;
 			}
 
-			if (!length(t.nets))
-				continue;
-
 			tunnels[i.interface] = t;
-
-			if (!tun_seen[i.interface]) {
-				tun_seen[i.interface] = 1;
-				push(dbg.tunnels, i.interface + ' ' + i.proto + ' (netifd) ' + join(',', map(t.nets, (n) => n.text)));
-			}
+			tun_seen[i.interface] = 1;
+			order[i.interface] = 1;
+			push(dbg.tunnels, i.interface + ' ' + i.proto + ' ' + join(',', map(t.nets, (n) => n.text)));
 		}
 	} catch (e) { }
 
-	// The same from the kernel, for a tunnel uci does not describe (a peer
-	// set with `awg setconf`, an interface made by a script): the addresses
-	// its device holds say which subnet its peers live in.
-	try {
-		let a = rtnl.request(rtnl.const.RTM_GETADDR, rtnl.const.NLM_F_DUMP, { family: rtnl.const.AF_INET });
+	// The peers themselves: a section with allowed_ips, in whichever config
+	// the app keeps them. Its interface comes from the section type
+	// (amneziawg_awg0), from option interface, or from its own name; with a
+	// single tunnel, an unclaimed section is that tunnel's.
+	for (let conf in VPN_CONFIGS) {
+		let c = cursor();
 
-		for (let n in ((type(a) == 'array') ? a : [])) {
-			if (type(n) != 'object' || !netdev(n.dev) || !match(n.dev, RE_TUN_DEV) || type(n.address) != 'string')
-				continue;
+		if (!c.load(conf))
+			continue;
 
-			let t = tunnels[n.dev] ?? { nets: [], own: {} };
-			let m = match(n.address + '/' + (type(n.prefixlen) == 'int' ? n.prefixlen : 32), RE_NET);
+		c.foreach(conf, (s) => {
+			if (s.disabled === '1' || s.allowed_ips == null)
+				return;
 
-			if (!m)
-				continue;
+			dbg.sections++;
 
-			let num = ip4num(m[1]), bits = +m[3];
+			let t = (type(s['.type']) == 'string') ? s['.type'] : '';
+			let m = match(t, RE_VPN_SECTION);
+			let cand = m ? m[2] : (type(s.interface) == 'string' ? s.interface : null);
 
-			if (num != null && bits >= 0 && bits <= 32) {
-				push(t.nets, { base: num, bits, text: m[1] + '/' + bits });
-				t.own[m[1]] = 1;
-				tunnels[n.dev] = t;
+			/* the interface's own section: it carries allowed_ips of its own
+			   when the app puts them there, and it is not a peer */
+			if (cand == null && tunnels[t] != null)
+				return;
 
-				if (!tun_seen[n.dev]) {
-					tun_seen[n.dev] = 1;
-					push(dbg.tunnels, n.dev + ' (kernel) ' + m[1] + '/' + bits);
-				}
+			if (cand == null)
+				cand = s['.name'];
+
+			if (cand == null)
+				return;
+
+			if (tunnels[cand] == null) {
+				let only = keys(order);
+
+				if (length(only) != 1)
+					return;
+
+				cand = only[0];
 			}
-		}
-	} catch (e) { }
 
-	// the peers the configuration names: allowed_ips of a peer section
-	cur.foreach(NETWORK, (s) => {
-		if (s.disabled === '1' || s.allowed_ips == null)
-			return;
+			let ips = [], list = (type(s.allowed_ips) == 'array') ? s.allowed_ips : [ s.allowed_ips ];
 
-		dbg.sections++;
+			for (let a in list)
+				if (type(a) == 'string' && match(trim(a), RE_CIDR) && length(ips) < MAX_PEER_IPS)
+					push(ips, trim(a));
 
-		let t = (type(s['.type']) == 'string') ? s['.type'] : '';
-		let m = match(t, RE_VPN_SECTION), iface = null;
+			/* a peer with no allowed address has nothing to show */
+			if (!length(ips))
+				return;
 
-		if (m)
-			iface = m[2];
-		else if (t == 'amneziawg' || t == 'wireguard')
-			iface = s['.name'];                  // config amneziawg 'awg0'
-		else if (type(s.interface) == 'string' && tunnels[s.interface])
-			iface = s.interface;                 // option interface 'awg0'
-
-		if (iface == null || tunnels[iface] == null)
-			return;
-
-		let ips = [], list = (type(s.allowed_ips) == 'array') ? s.allowed_ips : [ s.allowed_ips ];
-
-		for (let a in list)
-			if (type(a) == 'string' && match(trim(a), RE_CIDR) && length(ips) < MAX_PEER_IPS)
-				push(ips, trim(a));
-
-		/* a peer with no allowed address has nothing the dashboard can show */
-		if (!length(ips))
-			return;
-
-		peer_add(out, seen, iface, ips,
-			(type(s.description) == 'string' && length(s.description) <= 64) ? s.description : null);
-	});
+			peer_add(out, seen, cand, ips,
+				(type(s.description) == 'string' && length(s.description) <= 64 && s.description != '') ? s.description : null);
+		});
+	}
 
 	// and the ones only the connection tracker knows: a peer set with
 	// `awg setconf`, or one the configuration names by public key alone,
@@ -1001,8 +955,6 @@ function vpn() {
 	if (length(tunnels)) {
 		let now = clock(true)?.[0] ?? 0;
 
-		/* the table is a few hundred kilobytes on a busy router and changes
-		   by the second: read it once per CT_TTL, not on every poll */
 		if (ct_hosts == null || now - ct_at >= CT_TTL) {
 			let hosts = {}, text = null;
 
