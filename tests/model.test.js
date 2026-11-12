@@ -967,8 +967,8 @@ test('build: on a router, stations keep their LAN IPv4 address (not only IPv6)',
    be read: the ARP entries on a LAN subnet stand in, marked approximate */
 test('build: wired hosts from the host hints when the forwarding table is empty', () => {
 	const ifaces = [
-		{ interface: 'wan', up: true, l3_device: 'eth1', device: 'eth1', 'ipv4-address': [ { address: '100.64.0.2', mask: 24 } ],
-			route: [ { target: '0.0.0.0', mask: 0, nexthop: '100.64.0.1' } ] },
+		{ interface: 'wan', up: true, l3_device: 'eth1', device: 'eth1', 'ipv4-address': [ { address: '198.51.100.2', mask: 24 } ],
+			route: [ { target: '0.0.0.0', mask: 0, nexthop: '198.51.100.1' } ] },
 		{ interface: 'lan', up: true, l3_device: 'eth0', device: 'eth0', 'ipv4-address': [ { address: '192.0.2.1', mask: 24 } ] }
 	];
 	const devs = {
@@ -978,8 +978,8 @@ test('build: wired hosts from the host hints when the forwarding table is empty'
 	const hints = {
 		'00:00:5E:00:53:11': { ipaddrs: [ '192.0.2.11' ] },	/* behind the bridged AP */
 		'00:00:5E:00:53:12': { ipaddrs: [ '192.0.2.12' ] },
-		'00:00:5E:00:53:13': { ipaddrs: [ '100.64.0.9' ] },	/* the WAN side, never a client */
-		'00:00:5E:00:53:14': { ipaddrs: [ '10.9.9.9' ] },	/* another network */
+		'00:00:5E:00:53:13': { ipaddrs: [ '198.51.100.9' ] },	/* the WAN side, never a client */
+		'00:00:5E:00:53:14': { ipaddrs: [ '203.0.113.9' ] },	/* another network */
 		'00:00:5E:00:53:FF': { ipaddrs: [ '192.0.2.1' ] }	/* this device */
 	};
 	const m = model.build({ ifaces, devs, hints, fdb: [] });
