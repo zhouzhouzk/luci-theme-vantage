@@ -1182,12 +1182,12 @@ return view.extend({
 			if (m.radios.length) st.wireless = true;
 			else if (st.wireless !== true) st.wireless = false;
 		}
-		else if (st.wireless === undefined) {
-			/* no answer about wireless at all -- a device whose call failed,
-			   and a headless one looks the same: its own radios are the best
-			   evidence there is, and getting this wrong draws an access
-			   point with no radios and no tunnel under it */
-			st.wireless = !m.radios.length;
+		else if (st.wireless == null) {
+			/* no answer about wireless at all -- a call that failed, and a
+			   device without radios look the same. st.wireless means "has
+			   radios", so nothing to show is false: a wired-only device
+			   until an answer says otherwise (an answer sets it, and sticks) */
+			st.wireless = false;
 		}
 		m.wired = st.wireless === false;
 	},

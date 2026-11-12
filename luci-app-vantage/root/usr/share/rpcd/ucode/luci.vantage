@@ -1262,8 +1262,15 @@ function switches() {
 const methods = {
 	wireless: {
 		call: function() {
-			let reply = connect()?.call('network.wireless', 'status');
-			let out = {};
+			let reply = null, out = {};
+
+			// A device with no wireless support at all has no
+			// network.wireless object to ask, and the call throws: that is
+			// not an error worth failing the whole method over, it is a
+			// device with no radios.
+			try {
+				reply = connect()?.call('network.wireless', 'status');
+			} catch (e) { }
 
 			// no object, or one that skipped every radio (netifd has no
 			// handler for the vendor's driver type): the config instead
