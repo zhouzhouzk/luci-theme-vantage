@@ -857,7 +857,7 @@ function arp_hosts() {
 // luci-app-vantage.
 function vpn() {
 	let out = {}, seen = {}, tunnels = {}, tun_seen = {}, order = {};
-	let dbg = { tunnels: [], sections: 0, ct: 0, peers: 0 };
+	let dbg = { tunnels: [], sections: 0, awg: 0, ct: 0, peers: 0 };
 
 	// The tunnels the page draws, from netifd's dump: an interface it shows
 	// as amneziawg or wireguard is one this call knows, whatever the
@@ -890,6 +890,57 @@ function vpn() {
 			tun_seen[i.interface] = 1;
 			order[i.interface] = 1;
 			push(dbg.tunnels, i.interface + ' ' + i.proto + ' ' + join(',', map(t.nets, (n) => n.text)));
+		}
+	} catch (e) { }
+
+	// The AmneziaWG app's own answer first: luci-proto-amneziawg merges the
+	// config with `awg show all dump`, so it has the peer's description, the
+	// addresses it holds and its counters -- the same data its 对端 page
+	// shows. Whatever config file holds them, this finds them.
+	try {
+		let r = connect()?.call('luci.amneziawg', 'getAwgInstances', {});
+
+		for (let dev in (type(r) == 'object' ? r : {})) {
+			let inst = r[dev], iface = dev;
+
+			if (type(inst) != 'object' || type(inst.peers) != 'array')
+				continue;
+
+			if (tunnels[iface] == null) {
+				let only = keys(order);
+
+				if (length(only) != 1)
+					continue;
+
+				iface = only[0];
+			}
+
+			for (let p in inst.peers) {
+				if (type(p) != 'object' || type(p.allowed_ips) != 'array')
+					continue;
+
+				let ips = [];
+
+				for (let a in p.allowed_ips) {
+					if (type(a) != 'string')
+						continue;
+
+					let t = trim(a);
+
+					/* a default route is not an address the peer holds */
+					if (t == '0.0.0.0/0' || t == '::/0' || !match(t, RE_CIDR) || length(ips) >= MAX_PEER_IPS)
+						continue;
+
+					push(ips, t);
+				}
+
+				if (!length(ips))
+					continue;
+
+				dbg.awg++;
+				peer_add(out, seen, iface, ips,
+					(type(p.name) == 'string' && p.name != '' && length(p.name) <= 64) ? p.name : null);
+			}
 		}
 	} catch (e) { }
 
