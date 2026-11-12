@@ -133,6 +133,7 @@ const CT_LINES = 4096;            // lines looked at, on a busy router
 const CT_TTL = 15;                // seconds a reading is kept
 const RE_CT_ADDR = /^(src|dst)=([0-9]{1,3}(\.[0-9]{1,3}){3})$/;
 const RE_NET = /^([0-9]{1,3}(\.[0-9]{1,3}){3})\/([0-9]{1,2})$/;
+const RE_TUN_DEV = /^(awg|wg|tun|tap)[0-9]{0,3}$/;   // tunnel devices, by name
 /* peer sections: config amneziawg_awg0 / wireguard_wg0 -> interface awg0 */
 const RE_VPN_SECTION = /^(amneziawg|wireguard)_([A-Za-z0-9_.-]{1,15})$/;
 const RE_CIDR = /^[0-9a-fA-F:.]{2,45}\/[0-9]{1,3}$/;
@@ -748,7 +749,7 @@ function arp_hosts() {
 // Configuration and /proc are read; no key, nothing written. Read group
 // luci-app-vantage.
 function vpn() {
-	let out = {}, seen = {}, tunnels = {}, cur = cursor();
+	let out = {}, seen = {}, tunnels = {}, tun_seen = {}, cur = cursor();
 	/* what the call saw, for a dashboard that shows nothing: which tunnel
 	   interfaces it found, how many peer sections, how many addresses the
 	   connection tracker gave, and how many peers came out */
@@ -781,8 +782,40 @@ function vpn() {
 		}
 
 		tunnels[s['.name']] = { nets, own };
+		tun_seen[s['.name']] = 1;
 		push(dbg.tunnels, s['.name'] + ' ' + s.proto + ' ' + join(',', map(nets, (n) => n.text)));
 	});
+
+	// The same from the kernel, for a tunnel uci does not describe (a peer
+	// set with `awg setconf`, an interface made by a script): the addresses
+	// its device holds say which subnet its peers live in.
+	try {
+		let a = rtnl.request(rtnl.const.RTM_GETADDR, rtnl.const.NLM_F_DUMP, { family: rtnl.const.AF_INET });
+
+		for (let n in ((type(a) == 'array') ? a : [])) {
+			if (type(n) != 'object' || !netdev(n.dev) || !match(n.dev, RE_TUN_DEV) || type(n.address) != 'string')
+				continue;
+
+			let t = tunnels[n.dev] ?? { nets: [], own: {} };
+			let m = match(n.address + '/' + (type(n.prefixlen) == 'int' ? n.prefixlen : 32), RE_NET);
+
+			if (!m)
+				continue;
+
+			let num = ip4num(m[1]), bits = +m[3];
+
+			if (num != null && bits >= 0 && bits <= 32) {
+				push(t.nets, { base: num, bits, text: m[1] + '/' + bits });
+				t.own[m[1]] = 1;
+				tunnels[n.dev] = t;
+
+				if (!tun_seen[n.dev]) {
+					tun_seen[n.dev] = 1;
+					push(dbg.tunnels, n.dev + ' (kernel) ' + m[1] + '/' + bits);
+				}
+			}
+		}
+	} catch (e) { }
 
 	// the peers the configuration names: allowed_ips of a peer section
 	cur.foreach(NETWORK, (s) => {

@@ -950,6 +950,7 @@ return view.extend({
 					routes: r[8] && Array.isArray(r[8].routes) ? (self.kernelRoutes = r[8].routes) : (self.kernelRoutes || null),
 					vpn: (r[9] && typeof r[9] === 'object' && r[9].peers && typeof r[9].peers === 'object') ? r[9].peers : {},
 					vpnError: vpnError ? String((vpnError && (vpnError.message || vpnError.status || vpnError)) || '') : null,
+					vpnDebug: (r[9] && typeof r[9] === 'object' && r[9].debug && typeof r[9].debug === 'object') ? r[9].debug : null,
 					assoc: assoc, hapd: hapd, hapdStatus: hapdStatus, iwinfo: iwinfo, survey: survey, at: Date.now(), started: started };
 			});
 		});
@@ -2541,8 +2542,19 @@ return view.extend({
 					});
 					/* a tunnel with nothing under it: say why, so an empty
 					   node is not mistaken for a broken page */
-					if (!rows.length && /^(amneziawg|wireguard)$/i.test(String(n.proto || '')))
-						rows.push(E('span', { 'class': 'vt-empty-inline' }, [ vErr ? _('Peers unavailable: log out and back in') : _('No peers seen') ]));
+					if (!rows.length && /^(amneziawg|wireguard)$/i.test(String(n.proto || ''))) {
+						var note = E('span', { 'class': 'vt-empty-inline' }, [ vErr ? _('Peers unavailable: log out and back in') : _('No peers seen') ]);
+
+						/* what the call saw, on hover: an empty node is either no
+						   tunnel found, no peer section, or no flow to learn from */
+						var vd = self.lastRaw && self.lastRaw.vpnDebug;
+						if (vd && !vErr)
+							setTitle(note, _('Tunnels: %s · peer sections: %d · flows: %d').format(
+								(Array.isArray(vd.tunnels) ? vd.tunnels.join('; ') : '') || fmt.DASH,
+								Number(vd.sections) || 0, Number(vd.ct) || 0));
+
+						rows.push(note);
+					}
 					dom.content(b.col, rows);
 				}
 			});
