@@ -127,6 +127,12 @@ const RE_ARP = /^(\S+)\s+\S+\s+(0x[0-9a-f]{1,8})\s+(\S+)\s+\S+\s+(\S+)/;
 const RE_WAN_DEV = /^(wan|ppp|pppoe|wwan)/;   // a peer beyond these is not a client
 const RE_IPV4 = /^[0-9]{1,3}(\.[0-9]{1,3}){3}$/;
 const RE_LEASE = /^\S+\s+(\S+)\s+(\S+)\s+(\S+)/;   // expiry, MAC, address, name
+const CT_FILES = [ '/proc/net/nf_conntrack', '/proc/net/ip_conntrack' ];
+const CT_MAX = 262144;            // bytes read of the connection table
+const CT_LINES = 4096;            // lines looked at, on a busy router
+const CT_TTL = 15;                // seconds a reading is kept
+const RE_CT_ADDR = /^(src|dst)=([0-9]{1,3}(\.[0-9]{1,3}){3})$/;
+const RE_NET = /^([0-9]{1,3}(\.[0-9]{1,3}){3})\/([0-9]{1,2})$/;
 /* peer sections: config amneziawg_awg0 / wireguard_wg0 -> interface awg0 */
 const RE_VPN_SECTION = /^(amneziawg|wireguard)_([A-Za-z0-9_.-]{1,15})$/;
 const RE_CIDR = /^[0-9a-fA-F:.]{2,45}\/[0-9]{1,3}$/;
@@ -556,6 +562,10 @@ function netdev(v) {
 let fdb_last = null;
 let fdb_le = null;
 
+// the connection tracker's tunnel addresses, and when they were read
+let ct_hosts = null;
+let ct_at = 0;
+
 // The bridges' sysfs brforward tables: FDB_ENTRY-byte records (MAC, port
 // number, is_local, ageing in 1/100 s, the port number's high byte),
 // and the kernel fills only as many as asked for, so no more than the
@@ -613,6 +623,53 @@ function bridge_table() {
 	}
 
 	return { sig, ages, multi };
+}
+
+// '10.0.0.1' -> 167772161, or null when it is not an address
+function ip4num(v) {
+	let p = split(v, '.'), n = 0;
+
+	if (length(p) != 4)
+		return null;
+
+	for (let o in p) {
+		let x = +o;
+
+		if (!(x >= 0 && x <= 255))
+			return null;
+
+		n = n * 256 + x;
+	}
+
+	return n;
+}
+
+function in_net(ip, base, bits) {
+	let mask = (bits <= 0) ? 0 : ((0xFFFFFFFF << (32 - bits)) & 0xFFFFFFFF);
+
+	return (ip & mask) == (base & mask);
+}
+
+// one peer on one interface, each address once
+function peer_add(out, seen, iface, ips, desc) {
+	let list = out[iface] ?? [], fresh = [];
+
+	if (length(list) >= MAX_PEERS)
+		return;
+
+	for (let ip in ips) {
+		if (seen[iface + '|' + ip])
+			continue;
+
+		seen[iface + '|' + ip] = 1;
+		push(fresh, ip);
+	}
+
+	if (!length(fresh))
+		return;
+
+	push(list, { desc, ips: fresh });
+	out[iface] = list;
 }
 
 // The names dnsmasq handed out, by MAC: the one thing that makes a list of
@@ -680,65 +737,145 @@ function arp_hosts() {
 }
 
 // The peers of the WireGuard and AmneziaWG interfaces, by interface name:
-// one entry per peer section (`config amneziawg_awg0`, `config
-// wireguard_wg0`) with the addresses it holds inside the tunnel, which are
-// its allowed_ips, and its description. A peer has no MAC and no ARP entry,
-// so it is not one of the hosts: the dashboard draws it under its interface.
-// Configuration is read; no key, and nothing written. Read group
+// the addresses each peer holds inside the tunnel, with the description the
+// configuration gives it when there is one. Two sources, because neither
+// sees every peer: the peer sections of the network config (a section with
+// allowed_ips, named by its type, by option interface, or by being
+// `config amneziawg 'awg0'`), and the connection tracker, for peers set by
+// `awg setconf` that no section lists -- their flows are in conntrack,
+// inside the tunnel's own subnet. A peer has no MAC and no ARP entry, so it
+// is not one of the hosts: the dashboard draws it under its interface.
+// Configuration and /proc are read; no key, nothing written. Read group
 // luci-app-vantage.
 function vpn() {
-	let out = {}, tunnels = {}, cur = cursor();
+	let out = {}, seen = {}, tunnels = {}, cur = cursor();
 
 	if (!cur.load(NETWORK))
 		return out;
 
-	// the tunnel interfaces first: a peer section that does not name its
-	// interface still belongs to the one whose addresses hold its subnet
+	// The tunnel interfaces first, with the subnets their peers live in:
+	// that is what tells a peer from a LAN client when the connection
+	// tracker names no interface.
 	cur.foreach(NETWORK, 'interface', (s) => {
-		if (s.proto == 'amneziawg' || s.proto == 'wireguard')
-			tunnels[s['.name']] = 1;
+		if (s.proto != 'amneziawg' && s.proto != 'wireguard')
+			return;
+
+		let nets = [], own = {}, list = (type(s.addresses) == 'array') ? s.addresses : [ s.addresses ];
+
+		for (let a in list) {
+			let m = (type(a) == 'string') ? match(trim(a), RE_NET) : null;
+
+			if (!m)
+				continue;
+
+			let n = ip4num(m[1]), bits = +m[3];
+
+			if (n != null && bits >= 0 && bits <= 32) {
+				push(nets, { base: n, bits });
+				own[m[1]] = 1;
+			}
+		}
+
+		tunnels[s['.name']] = { nets, own };
 	});
 
+	// the peers the configuration names: allowed_ips of a peer section
 	cur.foreach(NETWORK, (s) => {
 		if (s.disabled === '1' || s.allowed_ips == null)
 			return;
 
-		let t = type(s['.type']) == 'string' ? s['.type'] : '';
+		let t = (type(s['.type']) == 'string') ? s['.type'] : '';
 		let m = match(t, RE_VPN_SECTION), iface = null;
 
 		if (m)
 			iface = m[2];
+		else if (t == 'amneziawg' || t == 'wireguard')
+			iface = s['.name'];                  // config amneziawg 'awg0'
 		else if (type(s.interface) == 'string' && tunnels[s.interface])
 			iface = s.interface;                 // option interface 'awg0'
-		else if (tunnels[t])
-			return;                              // the interface itself, not a peer
 
-		if (iface == null)
-			return;
-
-		let peers = out[iface] ?? [];
-
-		if (length(peers) >= MAX_PEERS)
+		if (iface == null || tunnels[iface] == null)
 			return;
 
 		let ips = [], list = (type(s.allowed_ips) == 'array') ? s.allowed_ips : [ s.allowed_ips ];
 
-		for (let a in list) {
+		for (let a in list)
 			if (type(a) == 'string' && match(trim(a), RE_CIDR) && length(ips) < MAX_PEER_IPS)
 				push(ips, trim(a));
-		}
 
 		/* a peer with no allowed address has nothing the dashboard can show */
 		if (!length(ips))
 			return;
 
-		push(peers, {
-			desc: (type(s.description) == 'string' && length(s.description) <= 64) ? s.description : null,
-			ips
-		});
-
-		out[iface] = peers;
+		peer_add(out, seen, iface, ips,
+			(type(s.description) == 'string' && length(s.description) <= 64) ? s.description : null);
 	});
+
+	// and the ones only the connection tracker knows: a peer set with
+	// `awg setconf`, or one the configuration names by public key alone,
+	// is in no section, but its flows are here. Only addresses inside a
+	// tunnel's own subnet count, and never the tunnel's own address.
+	if (length(tunnels)) {
+		let now = clock(true)?.[0] ?? 0;
+
+		/* the table is a few hundred kilobytes on a busy router and changes
+		   by the second: read it once per CT_TTL, not on every poll */
+		if (ct_hosts == null || now - ct_at >= CT_TTL) {
+			let hosts = {}, text = null;
+
+			for (let f in CT_FILES) {
+				text = readfile(f, CT_MAX);
+
+				if (type(text) == 'string')
+					break;
+			}
+
+			if (type(text) == 'string') {
+				let lines = 0;
+
+				for (let line in split(text, '\n')) {
+					if (++lines > CT_LINES)
+						break;
+
+					if (!match(line, /src=/))
+						continue;
+
+					for (let tok in split(line, ' ')) {
+						let m = match(tok, RE_CT_ADDR);
+
+						if (!m)
+							continue;
+
+						let n = ip4num(m[2]);
+
+						if (n == null)
+							continue;
+
+						for (let name in tunnels) {
+							let t = tunnels[name];
+
+							if (t.own[m[2]])
+								continue;
+
+							for (let net in t.nets)
+								if (in_net(n, net.base, net.bits))
+									hosts[name + '|' + m[2]] = 1;
+						}
+					}
+				}
+			}
+
+			ct_hosts = hosts;
+			ct_at = now;
+		}
+
+		for (let key in ct_hosts) {
+			let p = split(key, '|');
+
+			if (length(p) == 2 && tunnels[p[0]] != null)
+				peer_add(out, seen, p[0], [ p[1] ], null);
+		}
+	}
 
 	return out;
 }
