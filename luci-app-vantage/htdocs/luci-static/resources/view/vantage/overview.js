@@ -47,7 +47,7 @@ var IWINFO_MS = 30 * 1000;
    association by a moment; in between, its last reply */
 var HINTS_MS = 30 * 1000;
 /* the AmneziaWG peer list: `awg show` plus a resolveip a peer, so rarely */
-var AWG_MS = 30 * 1000;
+var AWG_MS = 10 * 1000;
 var HINTS_HOT = 3;
 /* One clock for everything that moves (the status circle's ring, the Live
    beat, the flow dots, the backdrop): a compositor animation makes the
@@ -818,6 +818,9 @@ return view.extend({
 		var fdbError = null;
 		/* and why the tunnel peers could not be read, when they could not */
 		var vpnError = null;
+		/* a failed wireless call and a failed ct call used to be swallowed by
+		   the default, which then read as "no radios" and "no rates" */
+		var wifiError = null, ctError = null;
 		return Promise.all([
 			L.resolveDefault(callInfo(), {}),
 			L.resolveDefault(callRead('/proc/stat'), ''),
@@ -825,14 +828,14 @@ return view.extend({
 			L.resolveDefault(callDevs(), {}),
 			/* null when the call fails: no answer is not "no radios" (nor
 			   no sensors or no wired hosts, which then read as none) */
-			slow ? L.resolveDefault(callWifi(), null) : Promise.resolve(kept.wifi),
+			slow ? L.resolveDefault(callWifi().catch(function(e) { wifiError = e; return null; }), null) : Promise.resolve(kept.wifi),
 			hintsDue ? L.resolveDefault(callHints(), null) : Promise.resolve(this.hintsCache),
 			slow ? L.resolveDefault(callThermal(), null) : Promise.resolve(kept.thermal),
 			slow ? L.resolveDefault(callWired().catch(function(e) { fdbError = e; return null; }), null) : Promise.resolve(kept.wired),
 			/* null when the call fails (an older plugin): netifd's metrics decide */
 			L.resolveDefault(callRoutes(), null),
 			L.resolveDefault(callVpn().catch(function(e) { vpnError = e; return null; }), null),
-			L.resolveDefault(callCt(), null),
+			L.resolveDefault(callCt().catch(function(e) { ctError = e; return null; }), null),
 			awgDue ? L.resolveDefault(callAwg(), null) : Promise.resolve(this.awgCache)
 		]).then(function(r) {
 			var wifiDevs = (r[4] && typeof r[4] === 'object') ? r[4] : null;
@@ -977,6 +980,8 @@ return view.extend({
 					routes: r[8] && Array.isArray(r[8].routes) ? (self.kernelRoutes = r[8].routes) : (self.kernelRoutes || null),
 					vpn: (r[9] && typeof r[9] === 'object' && r[9].peers && typeof r[9].peers === 'object') ? r[9].peers : {},
 					vpnError: vpnError ? String((vpnError && (vpnError.message || vpnError.status || vpnError)) || '') : null,
+					wifiError: wifiError ? String((wifiError && (wifiError.message || wifiError.status || wifiError)) || '') : null,
+					ctError: ctError ? String((ctError && (ctError.message || ctError.status || ctError)) || '') : null,
 					vpnDebug: (r[9] && typeof r[9] === 'object' && r[9].debug && typeof r[9].debug === 'object') ? r[9].debug : null,
 					ct: (r[10] && typeof r[10] === 'object' && r[10].addrs && typeof r[10].addrs === 'object') ? r[10].addrs : {},
 					vpnAwg: (self.awgCache && typeof self.awgCache === 'object') ? self.awgCache : {},
@@ -2329,8 +2334,11 @@ return view.extend({
 	   place */
 	heroKey: function() {
 		var m = this.m, tail = '\nwired=' + this.wiredPorts().join(',') + '\nlines=' + this.extraLines().map(function(x) { return x.iface; }).join(',');
-		if (m.wired) return 'w\n' + m.networks.filter(function(n) { return n.up; }).slice(0, 8).map(function(n) { return n.name; }).join('\n') + tail;
-		return 'r\n' + m.radios.map(function(r) {
+		/* the empty states carry the reason a call failed: rebuild when it
+		   changes, or the line keeps saying the first thing it said */
+		var err = '\n' + [ (this.lastRaw && this.lastRaw.wifiError) || '', (this.lastRaw && this.lastRaw.vpnError) || '' ].join('|');
+		if (m.wired) return 'w' + err + '\n' + m.networks.filter(function(n) { return n.up; }).slice(0, 8).map(function(n) { return n.name; }).join('\n') + tail;
+		return 'r' + err + '\n' + m.radios.map(function(r) {
 			return r.id + '=' + m.ssids.filter(function(s) { return s.radio === r.id; }).map(function(s) { return s.id; }).join(',');
 		}).join('\n') + tail;
 	},
@@ -2448,16 +2456,7 @@ return view.extend({
 		h.watch = [ path, h.gw, h.link, h.ap, h.branches ];
 		h.lines.forEach(function(ln) { h.watch.push(ln.el); });
 		if (m.wired) {
-			m.networks.filter(function(n) { return n.up; }).slice(0, 8).forEach(function(n) {
-				var b = { id: n.name, ssids: [], peerSig: null, kicker: span('vt-node-kicker'), title: span('vt-node-title'), addr: span('vt-node-sub vt-mono'), sub: span('vt-node-sub vt-tn') };
-				b.el = E('a', { 'class': 'vt-node vt-node-radio vt-node-net', 'href': L.url.apply(L, insight.PAGES.network) }, [
-					E('span', { 'class': 'vt-node-body' }, [ b.kicker, b.title, b.addr, b.sub ])
-				]);
-				/* a tunnel's peers: its far ends, listed beside it */
-				b.col = E('div', { 'class': 'vt-branch-ssids' });
-				b.wrap = E('div', { 'class': 'vt-branch' }, [ b.el, b.col ]);
-				h.radios.push(b);
-			});
+			m.networks.filter(function(n) { return n.up; }).slice(0, 8).forEach(function(n) { h.radios.push(self.networkNode(n)); });
 			if (!h.radios.length) h.branches.appendChild(E('div', { 'class': 'vt-empty-inline' }, [ _('No other interfaces are up') ]));
 		}
 		else {
@@ -2481,7 +2480,16 @@ return view.extend({
 				b.wrap = E('div', { 'class': 'vt-branch' }, [ b.el, col ]);
 				h.radios.push(b);
 			});
-			if (!h.radios.length) h.branches.appendChild(E('div', { 'class': 'vt-empty-inline' }, [ _('No radios reported') ]));
+			if (!h.radios.length) {
+				var wErr = self.lastRaw && self.lastRaw.wifiError;
+				h.branches.appendChild(E('div', { 'class': 'vt-empty-inline', 'title': wErr || '' },
+					[ wErr ? _('No radios: the wireless call failed (%s)').format(wErr) : _('No radios reported') ]));
+			}
+			/* a tunnel is not a radio: its node and its peers belong here too,
+			   or a device with radios loses its VPN from the picture */
+			m.networks.filter(function(n) {
+				return n.up && /^(amneziawg|wireguard)$/i.test(String(n.proto || ''));
+			}).slice(0, 4).forEach(function(n) { h.radios.push(self.networkNode(n)); });
 		}
 		/* wired hosts downstream: one branch beside the radios or the
 		   networks, a node per port; its id is no interface's name */
@@ -2571,61 +2579,14 @@ return view.extend({
 			ln.rate = r ? r.rx + r.tx : 0;
 		});
 
+		var nets = Object.create(null);
+		m.networks.forEach(function(n) { if (n.up && !nets[n.name]) nets[n.name] = n; });
+
 		if (m.wired) {
-			var nets = Object.create(null);
-			m.networks.forEach(function(n) { if (n.up && !nets[n.name]) nets[n.name] = n; });
 			h.radios.forEach(function(b) {
 				if (b.wired) { self.updateWiredBranch(b); return; }
 				var n = nets[b.id];
-				if (!n) return;
-				var r = n.dev ? st.devRates[n.dev] : null;
-				setTitle(b.el, [ n.name, n.dev, n.ipv4 ].filter(Boolean).join(' · '));
-				txt(b.kicker, n.proto || _('Interface'));
-				txt(b.title, n.name);
-				txt(b.addr, n.ipv4 ? n.ipv4.split('/')[0] : (n.dev || fmt.DASH));
-				txt(b.sub, r ? fmt.rates(r.tx, r.rx) : fmt.DASH);
-				b.active = !!(r && r.rx + r.tx > 50e3);
-				b.rate = r ? r.rx + r.tx : 0;
-				/* the tunnel's peers, rebuilt when one joins, leaves or is renamed */
-				var peers = Array.isArray(n.peers) ? n.peers : [];
-				var psig = peers.map(function(p) {
-					var pr = st.peerRates[n.name + '|' + ((Array.isArray(p.ips) ? p.ips : [])[0] || '')];
-					return (p.name || '') + '|' + (Array.isArray(p.ips) ? p.ips : []).join(',') + '|' + (pr ? Math.round(pr.rx + pr.tx) : '');
-				}).join(';');
-				if (b.col && psig !== b.peerSig) {
-					b.peerSig = psig;
-					var vErr = self.lastRaw && self.lastRaw.vpnError;
-					var rows = peers.map(function(p) {
-						var ips = Array.isArray(p.ips) ? p.ips : [], bare = (ips[0] || '').split('/')[0];
-						var pr = st.peerRates[n.name + '|' + (ips[0] || '')];
-						return E('div', { 'class': 'vt-node vt-node-ssid', 'title': ips.join(' · ') }, [
-							E('span', { 'class': 'vt-node-body' }, [
-								E('span', { 'class': 'vt-node-title vt-ssid-name' }, [ p.name || bare || fmt.DASH ]),
-								E('span', { 'class': 'vt-node-sub vt-tn' }, [ p.name ? bare : '' ]),
-								E('span', { 'class': 'vt-node-sub vt-node-rates vt-tn' }, [ pr ? fmt.rates(pr.tx, pr.rx) : '' ])
-							])
-						]);
-					});
-					/* a tunnel with nothing under it: say why, so an empty
-					   node is not mistaken for a broken page */
-					if (!rows.length && /^(amneziawg|wireguard)$/i.test(String(n.proto || ''))) {
-						/* what the call saw, in the line itself: an empty node is
-						   either no tunnel found, no peer section, or no flow */
-						var vd = self.lastRaw && self.lastRaw.vpnDebug;
-						var why = vd ? ' · t:%d s:%d f:%d'.format(
-							Array.isArray(vd.tunnels) ? vd.tunnels.length : 0,
-							Number(vd.sections) || 0, Number(vd.ct) || 0) : '';
-
-						rows.push(E('span', { 'class': 'vt-empty-inline', 'title':
-							vd ? _('Tunnels: %s · peer sections: %d · flows: %d').format(
-								(Array.isArray(vd.tunnels) ? vd.tunnels.join('; ') : '') || fmt.DASH,
-								Number(vd.sections) || 0, Number(vd.ct) || 0) : '' },
-							[ vErr ? _('Peers unavailable: log out and back in') : _('No peers seen') + why ]));
-					}
-					/* the test harness's dom has no content(): append then */
-					if (typeof dom.content === 'function') dom.content(b.col, rows);
-					else rows.forEach(function(r) { b.col.appendChild(r); });
-				}
+				if (n) self.updateNetworkBranch(b, n);
 			});
 			return;
 		}
@@ -2635,6 +2596,7 @@ return view.extend({
 		m.ssids.forEach(function(s) { ssids[s.id] = s; });
 		h.radios.forEach(function(b) {
 			if (b.wired) { self.updateWiredBranch(b); return; }
+			if (b.net) { var nb = nets[b.net]; if (nb) self.updateNetworkBranch(b, nb); return; }
 			var r = radios[b.id], rr = st.radioRates[b.id];
 			if (!r) return;
 			setClass(b.el, 'vt-node vt-node-radio' + (r.up ? '' : ' vt-node-off'));
@@ -3368,6 +3330,82 @@ return view.extend({
 		this.el.clients.scrollIntoView({ behavior: reducedMotion() ? 'auto' : 'smooth', block: 'start' });
 	},
 
+	/* a network's node: its name, its address, its rates, and the peers
+	   that hang under it */
+	updateNetworkBranch: function(b, n) {
+		var self = this, st = this.st;
+		var r = n.dev ? st.devRates[n.dev] : null;
+		setTitle(b.el, [ n.name, n.dev, n.ipv4 ].filter(Boolean).join(' · '));
+		txt(b.kicker, n.proto || _('Interface'));
+		txt(b.title, n.name);
+		txt(b.addr, n.ipv4 ? n.ipv4.split('/')[0] : (n.dev || fmt.DASH));
+		txt(b.sub, r ? fmt.rates(r.tx, r.rx) : fmt.DASH);
+		b.active = !!(r && r.rx + r.tx > 50e3);
+		b.rate = r ? r.rx + r.tx : 0;
+		/* the tunnel's peers, rebuilt when one joins, leaves or is renamed */
+		var peers = Array.isArray(n.peers) ? n.peers : [];
+		var psig = peers.map(function(p) {
+			var pr = st.peerRates[n.name + '|' + ((Array.isArray(p.ips) ? p.ips : [])[0] || '')];
+			return (p.name || '') + '|' + (Array.isArray(p.ips) ? p.ips : []).join(',') + '|' + (pr ? Math.round(pr.rx + pr.tx) : '');
+		}).join(';');
+		if (b.col && psig !== b.peerSig) {
+			b.peerSig = psig;
+			var vErr = self.lastRaw && self.lastRaw.vpnError;
+			var rows = peers.map(function(p) {
+				var ips = Array.isArray(p.ips) ? p.ips : [], bare = (ips[0] || '').split('/')[0];
+				var pr = st.peerRates[n.name + '|' + (ips[0] || '')];
+				return E('div', { 'class': 'vt-node vt-node-ssid', 'title': ips.join(' · ') }, [
+					E('span', { 'class': 'vt-node-body' }, [
+						E('span', { 'class': 'vt-node-title vt-ssid-name' }, [ p.name || bare || fmt.DASH ]),
+						E('span', { 'class': 'vt-node-sub vt-tn' }, [ p.name ? bare : '' ]),
+						E('span', { 'class': 'vt-node-sub vt-node-rates vt-tn' }, [ pr ? fmt.rates(pr.tx, pr.rx) : '' ])
+					])
+				]);
+			});
+			/* a tunnel with nothing under it: say why, so an empty
+			   node is not mistaken for a broken page */
+			if (!rows.length && /^(amneziawg|wireguard)$/i.test(String(n.proto || ''))) {
+				/* what the call saw, in the line itself: an empty node is
+				   either no tunnel found, no peer section, or no flow */
+				var vd = self.lastRaw && self.lastRaw.vpnDebug;
+				var why = vd ? ' · t:%d s:%d f:%d'.format(
+					Array.isArray(vd.tunnels) ? vd.tunnels.length : 0,
+					Number(vd.sections) || 0, Number(vd.ct) || 0) : '';
+
+				rows.push(E('span', { 'class': 'vt-empty-inline', 'title':
+					vd ? _('Tunnels: %s · peer sections: %d · flows: %d').format(
+						(Array.isArray(vd.tunnels) ? vd.tunnels.join('; ') : '') || fmt.DASH,
+						Number(vd.sections) || 0, Number(vd.ct) || 0) : '' },
+					[ vErr ? _('Peers unavailable: log out and back in') : _('No peers seen') + why ]));
+			}
+			/* the test harness's dom has no content(): append then */
+			if (typeof dom.content === 'function') dom.content(b.col, rows);
+			else rows.forEach(function(r) { b.col.appendChild(r); });
+		}
+	},
+
+	/* a network's node on the path: the interface the page draws beside the
+	   device (lan, a tunnel, ...), with a column for what hangs under it */
+	networkNode: function(n) {
+		function span(cls) { return E('span', { 'class': cls }); }
+		var b = { id: n.name, net: true, ssids: [], peerSig: null, kicker: span('vt-node-kicker'),
+			title: span('vt-node-title'), addr: span('vt-node-sub vt-mono'), sub: span('vt-node-sub vt-tn') };
+
+		b.el = E('a', { 'class': 'vt-node vt-node-radio vt-node-net', 'href': L.url.apply(L, insight.PAGES.network) }, [
+			E('span', { 'class': 'vt-node-body' }, [ b.kicker, b.title, b.addr, b.sub ])
+		]);
+
+		/* a tunnel's peers: its far ends, listed beside it */
+		b.col = E('div', { 'class': 'vt-branch-ssids' });
+		b.wrap = E('div', { 'class': 'vt-branch' }, [ b.el, b.col ]);
+
+		return b;
+	},
+
+	/* a network's node on the path: the interface the page draws beside the
+	   device (lan, a tunnel, ...), with a column for what hangs under it */
+	peerListPlaceholder: null,
+
 	/* the tunnels' peers as list rows: a name, the address it holds, and the
 	   counters the AmneziaWG app reports. No MAC, so no avatar hue, no
 	   drawer of its own -- it is not a device this page can name */
@@ -3695,7 +3733,11 @@ return view.extend({
 		var total = all.length;
 		/* nothing to divide per device: say so once, instead of a column of
 		   dashes that looks like a broken page */
-		var rateNote = (wired && total && !all.some(function(c) { return self.hostRate(c); })) ? ' · ' + _('no per-device rates') : '';
+		var rateNote = '';
+		if (wired && total && !all.some(function(c) { return self.hostRate(c); })) {
+			var cErr = self.lastRaw && self.lastRaw.ctError;
+			rateNote = ' · ' + (cErr ? _('no per-device rates (%s)').format(cErr) : _('no per-device rates'));
+		}
 		txt(el.count, (list.length !== total ? _('%d of %d').format(list.length, total)
 			: vpn ? (total === 1 ? _('1 peer') : _('%d peers').format(total))
 			: wired ? (total === 1 ? _('1 device') : _('%d devices').format(total))
