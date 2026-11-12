@@ -795,6 +795,8 @@ return view.extend({
 		/* why the forwarding table could not be read, when it could not:
 		   an answer of "none" and a failed call are not the same thing */
 		var fdbError = null;
+		/* and why the tunnel peers could not be read, when they could not */
+		var vpnError = null;
 		return Promise.all([
 			L.resolveDefault(callInfo(), {}),
 			L.resolveDefault(callRead('/proc/stat'), ''),
@@ -808,7 +810,7 @@ return view.extend({
 			slow ? L.resolveDefault(callWired().catch(function(e) { fdbError = e; return null; }), null) : Promise.resolve(kept.wired),
 			/* null when the call fails (an older plugin): netifd's metrics decide */
 			L.resolveDefault(callRoutes(), null),
-			L.resolveDefault(callVpn(), null)
+			L.resolveDefault(callVpn().catch(function(e) { vpnError = e; return null; }), null)
 		]).then(function(r) {
 			var wifiDevs = (r[4] && typeof r[4] === 'object') ? r[4] : null;
 			var wiredReply = (r[7] && typeof r[7] === 'object') ? r[7] : {};
@@ -947,6 +949,7 @@ return view.extend({
 					   keeps the last one: no tunnel blinking off */
 					routes: r[8] && Array.isArray(r[8].routes) ? (self.kernelRoutes = r[8].routes) : (self.kernelRoutes || null),
 					vpn: (r[9] && typeof r[9] === 'object' && r[9].peers && typeof r[9].peers === 'object') ? r[9].peers : {},
+					vpnError: vpnError ? String((vpnError && (vpnError.message || vpnError.status || vpnError)) || '') : null,
 					assoc: assoc, hapd: hapd, hapdStatus: hapdStatus, iwinfo: iwinfo, survey: survey, at: Date.now(), started: started };
 			});
 		});
@@ -2384,7 +2387,7 @@ return view.extend({
 		h.lines.forEach(function(ln) { h.watch.push(ln.el); });
 		if (m.wired) {
 			m.networks.filter(function(n) { return n.up; }).slice(0, 8).forEach(function(n) {
-				var b = { id: n.name, ssids: [], peerSig: '', kicker: span('vt-node-kicker'), title: span('vt-node-title'), addr: span('vt-node-sub vt-mono'), sub: span('vt-node-sub vt-tn') };
+				var b = { id: n.name, ssids: [], peerSig: null, kicker: span('vt-node-kicker'), title: span('vt-node-title'), addr: span('vt-node-sub vt-mono'), sub: span('vt-node-sub vt-tn') };
 				b.el = E('a', { 'class': 'vt-node vt-node-radio vt-node-net', 'href': L.url.apply(L, insight.PAGES.network) }, [
 					E('span', { 'class': 'vt-node-body' }, [ b.kicker, b.title, b.addr, b.sub ])
 				]);
@@ -2526,7 +2529,8 @@ return view.extend({
 				var psig = peers.map(function(p) { return (p.name || '') + '|' + (Array.isArray(p.ips) ? p.ips : []).join(','); }).join(';');
 				if (b.col && psig !== b.peerSig) {
 					b.peerSig = psig;
-					dom.content(b.col, peers.map(function(p) {
+					var vErr = self.lastRaw && self.lastRaw.vpnError;
+					var rows = peers.map(function(p) {
 						var ips = Array.isArray(p.ips) ? p.ips : [], bare = (ips[0] || '').split('/')[0];
 						return E('div', { 'class': 'vt-node vt-node-ssid', 'title': ips.join(' · ') }, [
 							E('span', { 'class': 'vt-node-body' }, [
@@ -2534,7 +2538,12 @@ return view.extend({
 								E('span', { 'class': 'vt-node-sub vt-tn' }, [ p.name ? bare : '' ])
 							])
 						]);
-					}));
+					});
+					/* a tunnel with nothing under it: say why, so an empty
+					   node is not mistaken for a broken page */
+					if (!rows.length && /^(amneziawg|wireguard)$/i.test(String(n.proto || '')))
+						rows.push(E('span', { 'class': 'vt-empty-inline' }, [ vErr ? _('Peers unavailable: log out and back in') : _('No peers seen') ]));
+					dom.content(b.col, rows);
 				}
 			});
 			return;

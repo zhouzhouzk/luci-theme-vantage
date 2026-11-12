@@ -749,9 +749,13 @@ function arp_hosts() {
 // luci-app-vantage.
 function vpn() {
 	let out = {}, seen = {}, tunnels = {}, cur = cursor();
+	/* what the call saw, for a dashboard that shows nothing: which tunnel
+	   interfaces it found, how many peer sections, how many addresses the
+	   connection tracker gave, and how many peers came out */
+	let dbg = { tunnels: [], sections: 0, ct: 0, peers: 0 };
 
 	if (!cur.load(NETWORK))
-		return out;
+		return { peers: out, debug: dbg };
 
 	// The tunnel interfaces first, with the subnets their peers live in:
 	// that is what tells a peer from a LAN client when the connection
@@ -771,18 +775,21 @@ function vpn() {
 			let n = ip4num(m[1]), bits = +m[3];
 
 			if (n != null && bits >= 0 && bits <= 32) {
-				push(nets, { base: n, bits });
+				push(nets, { base: n, bits, text: m[1] + '/' + bits });
 				own[m[1]] = 1;
 			}
 		}
 
 		tunnels[s['.name']] = { nets, own };
+		push(dbg.tunnels, s['.name'] + ' ' + s.proto + ' ' + join(',', map(nets, (n) => n.text)));
 	});
 
 	// the peers the configuration names: allowed_ips of a peer section
 	cur.foreach(NETWORK, (s) => {
 		if (s.disabled === '1' || s.allowed_ips == null)
 			return;
+
+		dbg.sections++;
 
 		let t = (type(s['.type']) == 'string') ? s['.type'] : '';
 		let m = match(t, RE_VPN_SECTION), iface = null;
@@ -872,12 +879,18 @@ function vpn() {
 		for (let key in ct_hosts) {
 			let p = split(key, '|');
 
-			if (length(p) == 2 && tunnels[p[0]] != null)
-				peer_add(out, seen, p[0], [ p[1] ], null);
+			if (length(p) != 2 || tunnels[p[0]] == null)
+				continue;
+
+			dbg.ct++;
+			peer_add(out, seen, p[0], [ p[1] ], null);
 		}
 	}
 
-	return out;
+	for (let name in out)
+		dbg.peers += length(out[name]);
+
+	return { peers: out, debug: dbg };
 }
 
 // [ { mac, port, bridge, vlan, seen } ] in dump order, at most MAX_HOSTS
@@ -1136,7 +1149,7 @@ const methods = {
 
 	vpn: {
 		call: function() {
-			return { peers: vpn() };
+			return vpn();
 		}
 	},
 
