@@ -513,8 +513,8 @@ test('networks: other interfaces, not loopback or the uplink, one per device', (
 	]);
 	assert.deepEqual(model.networks(null, null), []);
 	/* the tunnel's peers ride along with the network they belong to */
-	assert.deepEqual(model.networks(ifaces, up, { vpn: [ { desc: 'phone', ips: [ '203.0.113.9/32' ] } ] })[2].peers,
-		[ { name: 'phone', ips: [ '203.0.113.9/32' ] } ]);
+	assert.deepEqual(model.networks(ifaces, up, { vpn: [ { desc: 'phone', ips: [ '203.0.113.9/32' ], rx: 10, tx: 20 } ] })[2].peers,
+		[ { name: 'phone', ips: [ '203.0.113.9/32' ], rx: 10, tx: 20 } ]);
 });
 
 test('temps: hottest first, millidegrees to degrees, implausible readings left out', () => {
@@ -1031,8 +1031,8 @@ test('build: a tunnel is a network, and its peers stand under it', () => {
 	const n = m.networks.filter(x => x.name === 'awg0')[0];
 	assert.equal(n.proto, 'amneziawg');
 	assert.deepEqual(n.peers, [
-		{ name: 'phone', ips: [ '198.51.100.2/32' ] },
-		{ name: null, ips: [ '198.51.100.3/32', '2001:db8::3/128' ] }
+		{ name: 'phone', ips: [ '198.51.100.2/32' ], rx: null, tx: null },
+		{ name: null, ips: [ '198.51.100.3/32', '2001:db8::3/128' ], rx: null, tx: null }
 	], 'each peer with the addresses it holds inside the tunnel');
 	assert.deepEqual(model.build({ ifaces: m.networks.length ? undefined : [] }).networks, [], 'no ifaces, no networks');
 });

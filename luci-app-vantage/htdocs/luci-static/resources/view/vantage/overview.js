@@ -805,8 +805,10 @@ return view.extend({
 		   rpcd, which blocks every LuCI request while it runs. Asked only
 		   when a tunnel the page draws came back with no peers at all. */
 		var awgAge = started - (this.awgAt || 0);
+		/* the app has the per-peer counters no config file holds, so a tunnel
+		   is reason enough to ask; a device with no tunnel never does */
 		var awgBare = !!(this.m && (this.m.networks || []).some(function(n) {
-			return /^(amneziawg|wireguard)$/i.test(String(n.proto || '')) && !(n.peers || []).length;
+			return /^(amneziawg|wireguard)$/i.test(String(n.proto || ''));
 		}));
 		var awgDue = awgBare && !(awgAge >= 0 && awgAge < AWG_MS);
 		var hintsAge = started - (this.hintsAt || 0);
@@ -1007,6 +1009,7 @@ return view.extend({
 			clock: null, stat: null, cpu: held, cores: held ? held.cores.length : null, cpuMeasured: false,
 			devPrev: null, staPrev: null, devRates: Object.create(null), staRates: Object.create(null), radioRates: Object.create(null), ssidRates: Object.create(null),
 			ctPrev: null, ctRates: Object.create(null),
+			peerPrev: null, peerRates: Object.create(null),
 			hist: { net: net, cpu: series.valid(stored.cpu, 2, HIST_FAST, now), mem: series.valid(stored.mem, 2, HIST_MAX, now) },
 			clientHist: clientHist, bestStd: Object.create(null),
 			presence: null, isNew: Object.create(null), gone: [],
@@ -1016,7 +1019,7 @@ return view.extend({
 			wireless: null,
 			lastOk: 0, lastErr: null, paused: false
 		};
-		this.ui = { sorts: { wifi: { key: 'live', dir: -1 }, wired: { key: 'seen', dir: 1 } }, kind: 'wifi', filter: '', chip: 'all', drawer: null, editing: null, hover: null };
+		this.ui = { sorts: { wifi: { key: 'live', dir: -1 }, wired: { key: 'seen', dir: 1 }, vpn: { key: 'live', dir: -1 } }, kind: 'wifi', filter: '', chip: 'all', drawer: null, editing: null, hover: null };
 		this.folds = readFolds();
 		this.foldEls = {};
 		this.foldBtns = {};
@@ -1098,6 +1101,22 @@ return view.extend({
 			var cr = model.rates(st.ctPrev, ctCounters, at);
 			st.ctPrev = cr.next;
 			st.ctRates = cr.rates;
+		}
+
+		/* the tunnels' peers count their own bytes: same differ, key is
+		   the interface and the address the peer holds */
+		var peerCounters = Object.create(null);
+		(m.networks || []).forEach(function(n) {
+			if (!/^(amneziawg|wireguard)$/i.test(String(n.proto || ''))) return;
+			(n.peers || []).forEach(function(p) {
+				if (p.rx == null || p.tx == null) return;
+				peerCounters[n.name + '|' + (p.ips[0] || '')] = { rx: p.rx, tx: p.tx };
+			});
+		});
+		if (Object.keys(peerCounters).length) {
+			var pr = model.rates(st.peerPrev, peerCounters, at);
+			st.peerPrev = pr.next;
+			st.peerRates = pr.rates;
 		}
 		if (Object.keys(dr.rates).length || !Object.keys(devCounters).length) st.devRates = dr.rates;
 
@@ -1181,13 +1200,6 @@ return view.extend({
 		if (raw && raw.wifi) {
 			if (m.radios.length) st.wireless = true;
 			else if (st.wireless !== true) st.wireless = false;
-		}
-		else if (st.wireless == null) {
-			/* no answer about wireless at all -- a call that failed, and a
-			   device without radios look the same. st.wireless means "has
-			   radios", so nothing to show is false: a wired-only device
-			   until an answer says otherwise (an answer sets it, and sticks) */
-			st.wireless = false;
 		}
 		m.wired = st.wireless === false;
 	},
@@ -2576,16 +2588,21 @@ return view.extend({
 				b.rate = r ? r.rx + r.tx : 0;
 				/* the tunnel's peers, rebuilt when one joins, leaves or is renamed */
 				var peers = Array.isArray(n.peers) ? n.peers : [];
-				var psig = peers.map(function(p) { return (p.name || '') + '|' + (Array.isArray(p.ips) ? p.ips : []).join(','); }).join(';');
+				var psig = peers.map(function(p) {
+					var pr = st.peerRates[n.name + '|' + ((Array.isArray(p.ips) ? p.ips : [])[0] || '')];
+					return (p.name || '') + '|' + (Array.isArray(p.ips) ? p.ips : []).join(',') + '|' + (pr ? Math.round(pr.rx + pr.tx) : '');
+				}).join(';');
 				if (b.col && psig !== b.peerSig) {
 					b.peerSig = psig;
 					var vErr = self.lastRaw && self.lastRaw.vpnError;
 					var rows = peers.map(function(p) {
 						var ips = Array.isArray(p.ips) ? p.ips : [], bare = (ips[0] || '').split('/')[0];
+						var pr = st.peerRates[n.name + '|' + (ips[0] || '')];
 						return E('div', { 'class': 'vt-node vt-node-ssid', 'title': ips.join(' · ') }, [
 							E('span', { 'class': 'vt-node-body' }, [
 								E('span', { 'class': 'vt-node-title vt-ssid-name' }, [ p.name || bare || fmt.DASH ]),
-								E('span', { 'class': 'vt-node-sub vt-tn' }, [ p.name ? bare : '' ])
+								E('span', { 'class': 'vt-node-sub vt-tn' }, [ p.name ? bare : '' ]),
+								E('span', { 'class': 'vt-node-sub vt-node-rates vt-tn' }, [ pr ? fmt.rates(pr.tx, pr.rx) : '' ])
 							])
 						]);
 					});
@@ -2605,7 +2622,9 @@ return view.extend({
 								Number(vd.sections) || 0, Number(vd.ct) || 0) : '' },
 							[ vErr ? _('Peers unavailable: log out and back in') : _('No peers seen') + why ]));
 					}
-					dom.content(b.col, rows);
+					/* the test harness's dom has no content(): append then */
+					if (typeof dom.content === 'function') dom.content(b.col, rows);
+					else rows.forEach(function(r) { b.col.appendChild(r); });
 				}
 			});
 			return;
@@ -3349,6 +3368,63 @@ return view.extend({
 		this.el.clients.scrollIntoView({ behavior: reducedMotion() ? 'auto' : 'smooth', block: 'start' });
 	},
 
+	/* the tunnels' peers as list rows: a name, the address it holds, and the
+	   counters the AmneziaWG app reports. No MAC, so no avatar hue, no
+	   drawer of its own -- it is not a device this page can name */
+	peerList: function(m) {
+		var out = [];
+
+		(m.networks || []).forEach(function(n) {
+			if (!/^(amneziawg|wireguard)$/i.test(String(n.proto || '')))
+				return;
+
+			(n.peers || []).forEach(function(p) {
+				var ips = Array.isArray(p.ips) ? p.ips : [], ip = ips[0] || '';
+
+				if (!ip)
+					return;
+
+				var bare = ip.split('/')[0];
+
+				out.push({ peer: true, key: n.name + '|' + ip, iface: n.name,
+					name: p.name || bare, plainName: p.name || bare, bare: bare, ips: ips, mac: null });
+			});
+		});
+
+		return out;
+	},
+
+	peerRate: function(c) {
+		return (this.st.peerRates && this.st.peerRates[c.key]) || null;
+	},
+
+	peerCells: function(c, maxRate) {
+		var r = this.peerRate(c), total = r ? r.rx + r.tx : 0;
+		var bar = E('span', { 'class': 'vt-mini-fill' });
+		setW(bar, maxRate > 0 ? total / maxRate * 100 : 0);
+
+		return [
+			E('td', { 'class': 'vt-td-name', 'data-title': _('Device') }, [
+				E('div', { 'class': 'vt-who' }, [
+					E('div', { 'class': 'vt-who-text' }, [
+						E('div', { 'class': 'vt-who-label', 'title': c.name }, [ c.name ]),
+						E('div', { 'class': 'vt-who-sub' }, [ E('span', { 'class': 'vt-mono vt-who-id' }, [ c.bare ]) ])
+					])
+				])
+			]),
+			E('td', { 'class': 'vt-td-net', 'data-title': _('Network') }, [
+				E('div', { 'class': 'vt-net' }, [ E('span', { 'class': 'vt-net-ssid' }, [ c.iface ]) ])
+			]),
+			E('td', { 'class': 'vt-td-live', 'data-title': _('Live') }, [
+				E('div', { 'class': 'vt-live-cell' }, [
+					E('span', { 'class': 'vt-tn vt-live-total' }, [ r ? fmt.bits(total) : fmt.DASH ]),
+					E('span', { 'class': 'vt-mini' }, [ bar ]),
+					E('span', { 'class': 'vt-live-split vt-tn' }, [ r ? fmt.rates(r.tx, r.rx) : '' ])
+				])
+			])
+		];
+	},
+
 	/* a wired host's traffic: its port's, when it has the port to itself */
 	portRate: function(c) {
 		return c.shared ? null : this.st.devRates[c.port] || null;
@@ -3381,7 +3457,12 @@ return view.extend({
 				if (!ips.length)
 					return;
 
-				list.push({ desc: (typeof p.name === 'string' && p.name) ? p.name : null, ips: ips.slice(0, 4) });
+				list.push({
+					desc: (typeof p.name === 'string' && p.name) ? p.name : null,
+					ips: ips.slice(0, 4),
+					rx: isFinite(Number(p.transfer_rx)) ? Number(p.transfer_rx) : null,
+					tx: isFinite(Number(p.transfer_tx)) ? Number(p.transfer_tx) : null
+				});
 			});
 
 			if (list.length)
@@ -3410,6 +3491,12 @@ return view.extend({
 	},
 
 	sortValue: function(c, key) {
+		if (c.peer) {
+			if (key === 'name') return String(c.name).toLowerCase();
+			if (key === 'net') return String(c.iface || '').toLowerCase();
+			var pr = this.peerRate(c);
+			return pr ? pr.rx + pr.tx : -1;
+		}
 		var r = typeof c.port === 'string' ? this.portRate(c) : this.st.staRates[c.mac];
 		switch (key) {
 		case 'name': return String(c.name).toLowerCase();
@@ -3448,6 +3535,7 @@ return view.extend({
 	/* the quick filters of the list shown: [ id, label, count, warn ] */
 	filterDefs: function() {
 		var self = this, m = this.m, st = this.st, out;
+		if (this.ui.kind === 'vpn') return [];
 		if (this.ui.kind === 'wired') {
 			var hosts = m.wiredHosts, ports = [];
 			out = [ [ 'all', _('All'), hosts.length ] ];
@@ -3505,23 +3593,28 @@ return view.extend({
 	paintClients: function() {
 		var self = this, m = this.m, st = this.st, el = this.el, ui = this.ui;
 
-		/* Wi-Fi or wired: the switch shows where there are both; a device
-		   without radios lists its wired hosts only */
-		var hosts = m.wiredHosts || [], both = !!(hosts.length && !m.wired);
-		if (!both) ui.kind = m.wired ? 'wired' : 'wifi';
-		var wired = ui.kind === 'wired', all = wired ? hosts : m.clients;
-		el.kinds.hidden = !both;
-		var kindSig = both ? [ ui.kind, m.clients.length, hosts.length ].join(' ') : '';
+		/* One list, the kinds it holds: Wi-Fi stations, wired hosts, and the
+		   tunnels' peers -- which have no MAC, so neither of the other two
+		   could ever hold them */
+		var hosts = m.wiredHosts || [], peers = this.peerList(m), kinds = [];
+		if (m.clients.length || !hosts.length) kinds.push([ 'wifi', _('Wi-Fi'), m.clients.length, m.clients ]);
+		if (hosts.length) kinds.push([ 'wired', _('Wired'), hosts.length, hosts ]);
+		if (peers.length) kinds.push([ 'vpn', _('VPN'), peers.length, peers ]);
+		if (!kinds.some(function(k) { return k[0] === ui.kind; })) ui.kind = kinds.length ? kinds[0][0] : 'wifi';
+		var wired = ui.kind === 'wired', vpn = ui.kind === 'vpn';
+		var all = (kinds.filter(function(k) { return k[0] === ui.kind; })[0] || [ 0, 0, 0, [] ])[3];
+		el.kinds.hidden = kinds.length < 2;
+		var kindSig = kinds.map(function(k) { return k[0] + k[2]; }).join(' ') + '#' + ui.kind;
 		if (this.kindSig !== kindSig) {
 			this.kindSig = kindSig;
-			dom.content(el.kinds, !both ? [] : [ [ 'wifi', _('Wi-Fi'), m.clients.length ], [ 'wired', _('Wired'), hosts.length ] ].map(function(k) {
+			dom.content(el.kinds, kinds.length < 2 ? [] : kinds.map(function(k) {
 				return E('button', { 'type': 'button', 'class': 'vt-kind' + (ui.kind === k[0] ? ' vt-kind-on' : ''), 'aria-pressed': String(ui.kind === k[0]),
 					'click': function() { if (ui.kind !== k[0]) { ui.kind = k[0]; ui.chip = 'all'; self.pickClients(); } } }, [
 					E('span', {}, [ k[1] ]), E('span', { 'class': 'vt-kind-n vt-tn' }, [ String(k[2]) ])
 				]);
 			}));
 		}
-		var hint = wired ? _('Filter by name, address, port…') : _('Filter by name, address, SSID…');
+		var hint = vpn ? _('Filter by name or address…') : wired ? _('Filter by name, address, port…') : _('Filter by name, address, SSID…');
 		if (el.filter.getAttribute('placeholder') !== hint) el.filter.setAttribute('placeholder', hint);
 
 		var defs = this.filterDefs();
@@ -3531,7 +3624,8 @@ return view.extend({
 
 		/* header with sort buttons; wired hosts have a link and when the
 		   bridge last heard from them instead of radio figures */
-		var cols = wired ? [ [ 'name', _('Device') ], [ 'link', _('Link', 'vantage') ], [ 'net', _('Network') ], [ 'live', _('Live') ],
+		var cols = vpn ? [ [ 'name', _('Device') ], [ 'net', _('Network') ], [ 'live', _('Live') ] ]
+			: wired ? [ [ 'name', _('Device') ], [ 'link', _('Link', 'vantage') ], [ 'net', _('Network') ], [ 'live', _('Live') ],
 			[ 'seen', _('Last heard'), _('The bridge forgets a device after about five minutes without traffic') ] ]
 			: [ [ 'name', _('Device') ], [ 'signal', _('Signal') ], [ 'ssid', _('Network') ], [ 'rate', _('Link rate') ], [ 'live', _('Live') ], [ 'exp', _('Experience') ], [ 'time', _('Online', 'vantage') ] ];
 		var so = ui.sorts[ui.kind];
@@ -3554,33 +3648,38 @@ return view.extend({
 			if (va > vb) return so.dir;
 			return a.mac < b.mac ? -1 : 1;
 		});
-		var gone = !wired && (ui.chip === 'all' || ui.chip === 'new') ? st.gone.map(function(g) { return Object.assign({}, g.client, { gone: true, goneAt: g.at }); }).filter(function(c) {
+		var gone = !wired && !vpn && (ui.chip === 'all' || ui.chip === 'new') ? st.gone.map(function(g) { return Object.assign({}, g.client, { gone: true, goneAt: g.at }); }).filter(function(c) {
 			return !ui.filter || self.matches(Object.assign({}, c, { isNew: false }));
 		}) : [];
 		if (ui.chip === 'new') gone = [];
 
 		var maxRate = 0;
-		all.forEach(function(c) { var r = wired ? (self.portRate(c) || self.hostRate(c)) : st.staRates[c.mac]; if (r && r.rx + r.tx > maxRate) maxRate = r.rx + r.tx; });
+		all.forEach(function(c) {
+			var r = vpn ? self.peerRate(c) : wired ? (self.portRate(c) || self.hostRate(c)) : st.staRates[c.mac];
+			if (r && r.rx + r.tx > maxRate) maxRate = r.rx + r.tx;
+		});
 
 		var keep = new Set(), at = 0;
 		this.rowSig = this.rowSig || new Map();
 		list.concat(gone).forEach(function(c) {
-			var key = (wired ? 'wired:' : '') + (c.gone ? 'gone:' : '') + c.mac;
+			var key = (vpn ? 'vpn:' : wired ? 'wired:' : '') + (c.gone ? 'gone:' : '') + (c.key || c.mac);
 			keep.add(key);
 			var tr = self.rowMap.get(key);
 			if (!tr) {
 				tr = E('tr', { 'class': 'vt-row vt-row-enter', 'tabindex': '0' });
-				tr.addEventListener('click', function() { self.openDrawer('client', tr.getAttribute('data-mac')); });
-				tr.addEventListener('keydown', function(ev) { if (ev.key === 'Enter' || ev.key === ' ') { ev.preventDefault(); self.openDrawer('client', tr.getAttribute('data-mac')); } });
+				if (!vpn) {
+					tr.addEventListener('click', function() { self.openDrawer('client', tr.getAttribute('data-mac')); });
+					tr.addEventListener('keydown', function(ev) { if (ev.key === 'Enter' || ev.key === ' ') { ev.preventDefault(); self.openDrawer('client', tr.getAttribute('data-mac')); } });
+				}
 				self.rowMap.set(key, tr);
 			}
-			tr.setAttribute('data-mac', c.mac);
+			if (!vpn) tr.setAttribute('data-mac', c.mac);
 			tr.classList.toggle('vt-row-gone', !!c.gone);
 			tr.classList.toggle('vt-row-sel', !!(ui.drawer && ui.drawer.kind === 'client' && ui.drawer.id === c.mac));
-			tr.setAttribute('aria-label', _('Open details of %s').format(c.name));
+			tr.setAttribute('aria-label', vpn ? _('%s, %s').format(c.name, c.bare) : _('Open details of %s').format(c.name));
 			/* a row that would come out the same keeps its cells, and rows
 			   already in order stay where they are */
-			var cells = wired ? self.wiredCells(c, maxRate) : self.clientCells(c, maxRate), sig = treeSig(cells);
+			var cells = vpn ? self.peerCells(c, maxRate) : wired ? self.wiredCells(c, maxRate) : self.clientCells(c, maxRate), sig = treeSig(cells);
 			if (self.rowSig.get(key) !== sig) { dom.content(tr, cells); self.rowSig.set(key, sig); }
 			if (el.tbody.children[at] !== tr) el.tbody.insertBefore(tr, el.tbody.children[at] || null);
 			at++;
@@ -3594,10 +3693,14 @@ return view.extend({
 		window.setTimeout(function() { self.rowMap.forEach(function(tr) { tr.classList.remove('vt-row-enter'); }); }, 600);
 
 		var total = all.length;
-		txt(el.count, list.length !== total ? _('%d of %d').format(list.length, total)
+		/* nothing to divide per device: say so once, instead of a column of
+		   dashes that looks like a broken page */
+		var rateNote = (wired && total && !all.some(function(c) { return self.hostRate(c); })) ? ' · ' + _('no per-device rates') : '';
+		txt(el.count, (list.length !== total ? _('%d of %d').format(list.length, total)
+			: vpn ? (total === 1 ? _('1 peer') : _('%d peers').format(total))
 			: wired ? (total === 1 ? _('1 device') : _('%d devices').format(total))
-			: (total === 1 ? _('1 connected') : _('%d connected').format(total)));
-		el.count.hidden = both && list.length === total;
+			: (total === 1 ? _('1 connected') : _('%d connected').format(total))) + rateNote);
+		el.count.hidden = kinds.length < 2 && list.length === total && !rateNote;
 
 		el.clientsEmpty.hidden = list.length + gone.length > 0;
 		if (!el.clientsEmpty.hidden) {

@@ -525,7 +525,11 @@ return baseclass.extend({
 			}).slice(0, MAX_PEERS).map(function(p) {
 				return {
 					name: (typeof p.desc === 'string' && p.desc) ? fmt.safeText(p.desc, 32) : null,
-					ips: arr(p.ips).filter(function(a) { return typeof a === 'string'; }).slice(0, MAX_PEER_IPS).map(function(a) { return fmt.safeText(a, 48); })
+					ips: arr(p.ips).filter(function(a) { return typeof a === 'string'; }).slice(0, MAX_PEER_IPS).map(function(a) { return fmt.safeText(a, 48); }),
+					/* the peer's own counters, when something reported them:
+					   a rate needs two readings of them */
+					rx: finite(p.rx) ? p.rx : null,
+					tx: finite(p.tx) ? p.tx : null
 				};
 			});
 			return {
