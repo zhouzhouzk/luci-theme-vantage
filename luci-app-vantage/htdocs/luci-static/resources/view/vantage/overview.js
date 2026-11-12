@@ -1182,6 +1182,13 @@ return view.extend({
 			if (m.radios.length) st.wireless = true;
 			else if (st.wireless !== true) st.wireless = false;
 		}
+		else if (st.wireless === undefined) {
+			/* no answer about wireless at all -- a device whose call failed,
+			   and a headless one looks the same: its own radios are the best
+			   evidence there is, and getting this wrong draws an access
+			   point with no radios and no tunnel under it */
+			st.wireless = !m.radios.length;
+		}
 		m.wired = st.wireless === false;
 	},
 
@@ -2661,7 +2668,10 @@ return view.extend({
 			setClass(sn.el, 'vt-node vt-node-ssid' + (on.length ? '' : ' vt-node-idle'));
 			setTitle(sn.el, _('Show the devices on %s').format(sn.port) + (r ? '\n' + _('Port total: %s').format('↓ ' + fmt.bits(r.tx) + ' · ↑ ' + fmt.bits(r.rx)) : '') +
 				(sw ? '\n' + switchNote(sw) : ''));
-			txt(sn.name, one ? sn.port + ' · ' + one.name : sn.port);
+			/* the port leads to an access point when its owner says so: one
+			   host on it named and given the router icon names the port */
+			var ap = on.filter(function(c) { return c.alias && c.icon === 'router'; })[0];
+			txt(sn.name, ap ? ap.alias : one ? sn.port + ' · ' + one.name : sn.port);
 			txt(sn.count, one ? (one.speed ? fmt.phyRate(one.speed.mbps * 1000) : fmt.DASH) : _('%d devices').format(on.length));
 			txt(sn.rate, r ? fmt.rates(r.tx, r.rx) : fmt.DASH);
 			sn.active = !!(r && r.rx + r.tx > 50e3);

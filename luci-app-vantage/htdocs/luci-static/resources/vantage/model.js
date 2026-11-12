@@ -790,7 +790,8 @@ return baseclass.extend({
 		arr(raw.ifaces).forEach(function(i) {
 			var d = i && (i.l3_device || i.device);
 			if (typeof d === 'string' && i.interface && !lans[d])
-				lans[d] = { name: String(i.interface), ipv4: arr(i['ipv4-address']).map(function(a) { return a && a.address ? a.address + '/' + a.mask : null; }).filter(Boolean) };
+				lans[d] = { name: String(i.interface), proto: String(i.proto || ''),
+					ipv4: arr(i['ipv4-address']).map(function(a) { return a && a.address ? a.address + '/' + a.mask : null; }).filter(Boolean) };
 		});
 		/* the LAN interfaces and their subnets, never the uplink's: what a
 		   host with no forwarding entry of its own is looked up against */
@@ -798,12 +799,29 @@ return baseclass.extend({
 		Object.keys(lans).forEach(function(d) {
 			if (uplink && (d === uplink.port || d === uplink.dev)) return;
 			if (/^wan/i.test(lans[d].name) || !lans[d].ipv4.length) return;
+			/* a tunnel holds peers, not the LAN: on this device its address
+			   (10.0.0.1/24) once swallowed every wired host, and its subnet
+			   then hid theirs */
+			if (/^(awg|wg|tun|tap|ppp|pppoe|utun)/i.test(d) || /^(amneziawg|wireguard|openvpn|vpn|tunnel)$/i.test(lans[d].proto))
+				return;
 			lanDevs.push(d);
 			lans[d].ipv4.forEach(function(s) {
 				if (wanNets.indexOf(s) >= 0 || lanSubnets.indexOf(s) >= 0) return;
 				lanSubnets.push(s);
 			});
 		});
+		/* the interface whose subnet holds this address: the only honest way
+		   to say which network a host with no forwarding entry sits on */
+		function lanDevFor(ip) {
+			for (var i = 0; i < lanDevs.length; i++) {
+				var nets = lans[lanDevs[i]].ipv4;
+				for (var j = 0; j < nets.length; j++) {
+					var p = nets[j].split('/');
+					if (+p[1] >= 8 && self.ipv4InSubnet(ip, p[0], p[1])) return lanDevs[i];
+				}
+			}
+			return null;
+		}
 		function lanOf(h) { return h.bridge ? (h.vlan != null && lans[h.bridge + '.' + h.vlan]) || lans[h.bridge] || null : null; }
 		function wiredSubnets(mac) {
 			var l = lanOf(fdb[mac]);
@@ -821,12 +839,14 @@ return baseclass.extend({
 			Object.keys(hints).forEach(function(k) {
 				var mac = names.normMac(k);
 				if (!mac || staMacs[mac] || fdb[mac] || ownMacs[mac]) return;
-				var hint = obj(hints[k]), ips = self.hintAddrs(hint, lanSubnets);
-				/* an IPv4 address on a LAN subnet: what the ARP table
-				   knows, so a host that never sent a lease still counts */
-				if (!ips.some(function(a) { return a.indexOf(':') < 0; })) return;
+				var hint = obj(hints[k]);
+				var ip4 = arr(hint.ipaddrs).filter(function(a) { return typeof a === 'string' && a.indexOf(':') < 0; })[0];
+				if (!ip4) return;
+				var dev = lanDevFor(ip4);
+				/* an address on no LAN of this device is not its client */
+				if (!dev) return;
 				wiredMacs.push(mac);
-				fdb[mac] = { port: lanDevs[0], bridge: lanDevs[0], vlan: null, seen: null, approx: true };
+				fdb[mac] = { port: dev, bridge: dev, vlan: null, seen: null, approx: true };
 			});
 		}
 		/* an ARP entry names the interface a host answers on, not the bridge

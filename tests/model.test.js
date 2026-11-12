@@ -1072,3 +1072,25 @@ test('rates: per-address counters from the connection tracker', () => {
 	/* a connection closing takes its bytes with it: no invented negative rate */
 	assert.deepEqual(Object.keys(model.rates(next.next, { '192.0.2.9': { rx: 100, tx: 0 } }, 5000).rates), []);
 });
+
+/* A tunnel interface is not the LAN: on a router whose AmneziaWG device
+   holds 10.0.0.1/24, hosts with 192.0.2.x addresses were once attached to
+   it, and their addresses then fell outside its subnet and vanished. */
+test('build: hosts with no forwarding entry land on the interface that holds them', () => {
+	const ifaces = [
+		{ interface: 'wan', up: true, l3_device: 'pppoe-wan', device: 'eth0', 'ipv4-address': [ { address: '203.0.113.2', mask: 24 } ],
+			route: [ { target: '0.0.0.0', mask: 0, nexthop: '203.0.113.1' } ] },
+		{ interface: 'AmneziaWG', up: true, proto: 'amneziawg', l3_device: 'AmneziaWG', device: 'AmneziaWG',
+			'ipv4-address': [ { address: '192.0.2.200', mask: 24 } ] },
+		{ interface: 'lan', up: true, proto: 'static', l3_device: 'eth1', device: 'eth1', 'ipv4-address': [ { address: '192.0.2.1', mask: 24 } ] }
+	];
+	const devs = { eth0: { devtype: 'ethernet' }, AmneziaWG: { devtype: 'tunnel' }, eth1: { devtype: 'ethernet' } };
+	const m = model.build({ ifaces, devs, fdb: [], hints: {
+		'02:00:5E:00:53:21': { ipaddrs: [ '192.0.2.21' ] },
+		'02:00:5E:00:53:22': { ipaddrs: [ '192.0.2.22' ] }
+	} });
+	assert.deepEqual(m.wiredHosts.map(h => [ h.mac, h.port, h.network, h.ips ]), [
+		[ '02:00:5e:00:53:21', 'eth1', 'lan', [ '192.0.2.21' ] ],
+		[ '02:00:5e:00:53:22', 'eth1', 'lan', [ '192.0.2.22' ] ]
+	], 'the LAN interface, not the tunnel that happens to come first');
+});
