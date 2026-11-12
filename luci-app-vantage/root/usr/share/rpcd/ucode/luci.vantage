@@ -704,6 +704,28 @@ function lease_names() {
 	return out;
 }
 
+// netifd's interface dump, shared by the callers that need the addresses
+// this device holds: one ubus round trip serves several calls, and netifd
+// (unlike rpcd) answers while a plugin is running.
+let dump_val = null;
+let dump_at = 0;
+
+function iface_dump() {
+	let now = clock(true)?.[0] ?? 0;
+
+	if (dump_val == null || now - dump_at >= 5) {
+		dump_val = null;
+
+		try {
+			dump_val = connect()?.call('network.interface', 'dump', {});
+		} catch (e) { }
+
+		dump_at = now;
+	}
+
+	return dump_val;
+}
+
 // Whether an address is on a private network: the LAN side of a flow, which
 // is the only side a client can be. Same ranges as luci-app-netview.
 function is_private(ip) {
@@ -727,7 +749,7 @@ function ct_bytes() {
 
 	// the addresses this device holds, from the source the page draws from
 	try {
-		let dump = connect()?.call('network.interface', 'dump', {});
+		let dump = iface_dump();
 
 		for (let i in ((dump && type(dump.interface) == 'array') ? dump.interface : [])) {
 			for (let a in (type(i['ipv4-address']) == 'array' ? i['ipv4-address'] : [])) {
@@ -855,15 +877,20 @@ function arp_hosts() {
 // is not one of the hosts: the dashboard draws it under its interface.
 // Configuration and /proc are read; no key, nothing written. Read group
 // luci-app-vantage.
+//
+// Deliberately NOT luci.amneziawg getAwgInstances, though it knows more:
+// rpcd serves that object too, so calling it from here blocks rpcd on a
+// request to itself. It deadlocks, and every LuCI page hangs with it. The
+// dashboard asks it from the browser instead; this reads files only.
 function vpn() {
 	let out = {}, seen = {}, tunnels = {}, tun_seen = {}, order = {};
-	let dbg = { tunnels: [], sections: 0, awg: 0, ct: 0, peers: 0 };
+	let dbg = { tunnels: [], sections: 0, ct: 0, peers: 0 };
 
 	// The tunnels the page draws, from netifd's dump: an interface it shows
 	// as amneziawg or wireguard is one this call knows, whatever the
 	// configuration calls it, plus the subnets its peers live in.
 	try {
-		let dump = connect()?.call('network.interface', 'dump', {});
+		let dump = iface_dump();
 
 		for (let i in ((dump && type(dump.interface) == 'array') ? dump.interface : [])) {
 			if (type(i) != 'object' || (i.proto != 'amneziawg' && i.proto != 'wireguard'))
@@ -890,57 +917,6 @@ function vpn() {
 			tun_seen[i.interface] = 1;
 			order[i.interface] = 1;
 			push(dbg.tunnels, i.interface + ' ' + i.proto + ' ' + join(',', map(t.nets, (n) => n.text)));
-		}
-	} catch (e) { }
-
-	// The AmneziaWG app's own answer first: luci-proto-amneziawg merges the
-	// config with `awg show all dump`, so it has the peer's description, the
-	// addresses it holds and its counters -- the same data its 对端 page
-	// shows. Whatever config file holds them, this finds them.
-	try {
-		let r = connect()?.call('luci.amneziawg', 'getAwgInstances', {});
-
-		for (let dev in (type(r) == 'object' ? r : {})) {
-			let inst = r[dev], iface = dev;
-
-			if (type(inst) != 'object' || type(inst.peers) != 'array')
-				continue;
-
-			if (tunnels[iface] == null) {
-				let only = keys(order);
-
-				if (length(only) != 1)
-					continue;
-
-				iface = only[0];
-			}
-
-			for (let p in inst.peers) {
-				if (type(p) != 'object' || type(p.allowed_ips) != 'array')
-					continue;
-
-				let ips = [];
-
-				for (let a in p.allowed_ips) {
-					if (type(a) != 'string')
-						continue;
-
-					let t = trim(a);
-
-					/* a default route is not an address the peer holds */
-					if (t == '0.0.0.0/0' || t == '::/0' || !match(t, RE_CIDR) || length(ips) >= MAX_PEER_IPS)
-						continue;
-
-					push(ips, t);
-				}
-
-				if (!length(ips))
-					continue;
-
-				dbg.awg++;
-				peer_add(out, seen, iface, ips,
-					(type(p.name) == 'string' && p.name != '' && length(p.name) <= 64) ? p.name : null);
-			}
 		}
 	} catch (e) { }
 

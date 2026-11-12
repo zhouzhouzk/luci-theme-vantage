@@ -46,6 +46,8 @@ var IWINFO_MS = 30 * 1000;
    station or wired host first appears, since its lease follows its
    association by a moment; in between, its last reply */
 var HINTS_MS = 30 * 1000;
+/* the AmneziaWG peer list: `awg show` plus a resolveip a peer, so rarely */
+var AWG_MS = 30 * 1000;
 var HINTS_HOT = 3;
 /* One clock for everything that moves (the status circle's ring, the Live
    beat, the flow dots, the backdrop): a compositor animation makes the
@@ -95,6 +97,11 @@ var callVpn = rpc.declare({ object: 'luci.vantage', method: 'vpn', expect: { '':
 /* { addrs: { ip: { up, down, conns } } }: bytes per address, so a host
    behind a bridged access point has a traffic figure of its own */
 var callCt = rpc.declare({ object: 'luci.vantage', method: 'ct', expect: { '': {} } });
+/* luci-proto-amneziawg's own peer list: config merged with `awg show`, so
+   each peer comes with the description its 对端 page shows. Asked from the
+   browser, never from the rpcd plugin: that object is served by rpcd too,
+   and a plugin calling it blocks rpcd on itself. */
+var callAwg = rpc.declare({ object: 'luci.amneziawg', method: 'getAwgInstances', expect: { '': {} } });
 /* LuCI's own (its switch page's): link and speed of a switch's ports, in
    result. The whole reply, and a failed call rejected: a default [] would
    read as every port down */
@@ -793,6 +800,15 @@ return view.extend({
 		var slow = !lowPower() || !this.slowCache || !(age >= 0 && age < LOW_SLOW_MS);
 		var kept = this.slowCache || {};
 		/* the host hints: their last reply until they are due */
+		/* The AmneziaWG app's peer list is the last resort, not a habit: its
+		   getAwgInstances runs `awg show` and a resolveip per peer inside
+		   rpcd, which blocks every LuCI request while it runs. Asked only
+		   when a tunnel the page draws came back with no peers at all. */
+		var awgAge = started - (this.awgAt || 0);
+		var awgBare = !!(this.m && (this.m.networks || []).some(function(n) {
+			return /^(amneziawg|wireguard)$/i.test(String(n.proto || '')) && !(n.peers || []).length;
+		}));
+		var awgDue = awgBare && !(awgAge >= 0 && awgAge < AWG_MS);
 		var hintsAge = started - (this.hintsAt || 0);
 		var hintsDue = !this.hintsCache || this.hintsHot > 0 || !(hintsAge >= 0 && hintsAge < HINTS_MS);
 		/* why the forwarding table could not be read, when it could not:
@@ -814,7 +830,8 @@ return view.extend({
 			/* null when the call fails (an older plugin): netifd's metrics decide */
 			L.resolveDefault(callRoutes(), null),
 			L.resolveDefault(callVpn().catch(function(e) { vpnError = e; return null; }), null),
-			L.resolveDefault(callCt(), null)
+			L.resolveDefault(callCt(), null),
+			awgDue ? L.resolveDefault(callAwg(), null) : Promise.resolve(this.awgCache)
 		]).then(function(r) {
 			var wifiDevs = (r[4] && typeof r[4] === 'object') ? r[4] : null;
 			var wiredReply = (r[7] && typeof r[7] === 'object') ? r[7] : {};
@@ -843,6 +860,10 @@ return view.extend({
 			var per = [];
 			/* a failed call keeps the last reply, is asked again next poll
 			   and spends none of the extra tries after a new device */
+			if (awgDue && r[11] && typeof r[11] === 'object') {
+				self.awgCache = r[11];
+				self.awgAt = started;
+			}
 			if (hintsDue && r[5] && typeof r[5] === 'object') {
 				self.hintsCache = r[5];
 				self.hintsAt = started;
@@ -956,6 +977,7 @@ return view.extend({
 					vpnError: vpnError ? String((vpnError && (vpnError.message || vpnError.status || vpnError)) || '') : null,
 					vpnDebug: (r[9] && typeof r[9] === 'object' && r[9].debug && typeof r[9].debug === 'object') ? r[9].debug : null,
 					ct: (r[10] && typeof r[10] === 'object' && r[10].addrs && typeof r[10].addrs === 'object') ? r[10].addrs : {},
+					vpnAwg: (self.awgCache && typeof self.awgCache === 'object') ? self.awgCache : {},
 					assoc: assoc, hapd: hapd, hapdStatus: hapdStatus, iwinfo: iwinfo, survey: survey, at: Date.now(), started: started };
 			});
 		});
@@ -1050,7 +1072,8 @@ return view.extend({
 			assoc: raw.assoc, hapd: raw.hapd, hapdStatus: raw.hapdStatus, hints: raw.hints, fdb: raw.fdb,
 			switches: raw.switches, switchState: raw.switchState, routes: raw.routes,
 			aliases: this.aliases, rdns: st.rdns, mdns: st.mdns,
-			vendor: st.oui ? function(k) { return k ? st.oui.lookup(k) : null; } : null
+			vendor: st.oui ? function(k) { return k ? st.oui.lookup(k) : null; } : null,
+			vpn: this.vpnPeers(raw)
 		});
 		this.markWired(m, raw);
 		if (m.device.memory) series.push(st.hist.mem, [ at, m.device.memory.usedPct ], WINDOW_MS, HIST_MAX);
@@ -2565,14 +2588,14 @@ return view.extend({
 						/* what the call saw, in the line itself: an empty node is
 						   either no tunnel found, no peer section, or no flow */
 						var vd = self.lastRaw && self.lastRaw.vpnDebug;
-						var why = vd ? ' · t:%d a:%d s:%d f:%d'.format(
+						var why = vd ? ' · t:%d s:%d f:%d'.format(
 							Array.isArray(vd.tunnels) ? vd.tunnels.length : 0,
-							Number(vd.awg) || 0, Number(vd.sections) || 0, Number(vd.ct) || 0) : '';
+							Number(vd.sections) || 0, Number(vd.ct) || 0) : '';
 
 						rows.push(E('span', { 'class': 'vt-empty-inline', 'title':
-							vd ? _('Tunnels: %s · awg peers: %d · peer sections: %d · flows: %d').format(
+							vd ? _('Tunnels: %s · peer sections: %d · flows: %d').format(
 								(Array.isArray(vd.tunnels) ? vd.tunnels.join('; ') : '') || fmt.DASH,
-								Number(vd.awg) || 0, Number(vd.sections) || 0, Number(vd.ct) || 0) : '' },
+								Number(vd.sections) || 0, Number(vd.ct) || 0) : '' },
 							[ vErr ? _('Peers unavailable: log out and back in') : _('No peers seen') + why ]));
 					}
 					dom.content(b.col, rows);
@@ -3319,6 +3342,48 @@ return view.extend({
 	/* a wired host's traffic: its port's, when it has the port to itself */
 	portRate: function(c) {
 		return c.shared ? null : this.st.devRates[c.port] || null;
+	},
+
+	/* The peers under a tunnel: the AmneziaWG app knows them by name, the
+	   plugin by section, the connection tracker by flow. The app wins where
+	   it has an answer (it has the description the user typed), then the
+	   plugin, and the tracker's addresses are already in the plugin's. */
+	vpnPeers: function(raw) {
+		var out = Object.create(null), awg = raw.vpnAwg || {};
+
+		Object.keys(awg).forEach(function(dev) {
+			var inst = awg[dev];
+
+			if (!inst || !Array.isArray(inst.peers))
+				return;
+
+			var list = [];
+
+			inst.peers.forEach(function(p) {
+				if (!p || !Array.isArray(p.allowed_ips))
+					return;
+
+				/* a default route is not an address the peer holds */
+				var ips = p.allowed_ips.filter(function(a) {
+					return typeof a === 'string' && a !== '0.0.0.0/0' && a !== '::/0';
+				});
+
+				if (!ips.length)
+					return;
+
+				list.push({ desc: (typeof p.name === 'string' && p.name) ? p.name : null, ips: ips.slice(0, 4) });
+			});
+
+			if (list.length)
+				out[dev] = list;
+		});
+
+		var own = raw.vpn || {};
+		Object.keys(own).forEach(function(dev) {
+			if (!out[dev] || !out[dev].length) out[dev] = own[dev];
+		});
+
+		return out;
 	},
 
 	/* A host behind a shared port has no counter of ours: its frames belong
