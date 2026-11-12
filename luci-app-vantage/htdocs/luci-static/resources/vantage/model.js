@@ -732,9 +732,15 @@ return baseclass.extend({
 		   a static one), stations left out */
 		var staMacs = Object.create(null), fdb = Object.create(null), wiredMacs = [];
 		everyone.forEach(function(e) { staMacs[e.mac] = true; });
+		/* this device's own addresses, never listed as its clients */
+		var ownMacs = Object.create(null);
+		Object.keys(devs).forEach(function(n) {
+			var own = devs[n] && names.normMac(devs[n].macaddr || '');
+			if (own) ownMacs[own] = true;
+		});
 		arr(raw.fdb).forEach(function(h) {
 			var mac = h && names.normMac(h.mac);
-			if (!mac || staMacs[mac] || typeof h.port !== 'string' || self.isWireless(h.port, devs[h.port], wlNames)) return;
+			if (!mac || staMacs[mac] || ownMacs[mac] || typeof h.port !== 'string' || self.isWireless(h.port, devs[h.port], wlNames)) return;
 			var seen = finite(h.seen) && h.seen >= 0 ? h.seen : null, prev = fdb[mac];
 			if (prev && (seen == null || (prev.seen != null && prev.seen <= seen))) return;
 			if (!prev) wiredMacs.push(mac);
@@ -767,8 +773,43 @@ return baseclass.extend({
 			if (typeof d === 'string' && i.interface && !lans[d])
 				lans[d] = { name: String(i.interface), ipv4: arr(i['ipv4-address']).map(function(a) { return a && a.address ? a.address + '/' + a.mask : null; }).filter(Boolean) };
 		});
+		/* the LAN interfaces and their subnets, never the uplink's: what a
+		   host with no forwarding entry of its own is looked up against */
+		var lanDevs = [], lanSubnets = [], wanNets = uplink ? arr(uplink.ipv4) : [];
+		Object.keys(lans).forEach(function(d) {
+			if (uplink && (d === uplink.port || d === uplink.dev)) return;
+			if (/^wan/i.test(lans[d].name) || !lans[d].ipv4.length) return;
+			lanDevs.push(d);
+			lans[d].ipv4.forEach(function(s) {
+				if (wanNets.indexOf(s) >= 0 || lanSubnets.indexOf(s) >= 0) return;
+				lanSubnets.push(s);
+			});
+		});
 		function lanOf(h) { return h.bridge ? (h.vlan != null && lans[h.bridge + '.' + h.vlan]) || lans[h.bridge] || null : null; }
-		function wiredSubnets(mac) { var l = lanOf(fdb[mac]); return l && l.ipv4.length ? l.ipv4 : subnets; }
+		function wiredSubnets(mac) {
+			var l = lanOf(fdb[mac]);
+			if (l && l.ipv4.length) return l.ipv4;
+			return fdb[mac].approx && lanSubnets.length ? lanSubnets : subnets;
+		}
+		/* No forwarding entry at all: the LAN is not a Linux bridge (one
+		   Ethernet port, DSA without a bridge device) or the table could
+		   not be read (an older plugin, ucode-mod-rtnl missing). The host
+		   hints still know the addresses this device sees on its LAN
+		   subnets, so the clients of a bridged access point appear on the
+		   LAN's own interface, marked approximate: the port and its link
+		   speed are the interface's, not the client's. */
+		if (!wiredMacs.length && !arr(raw.fdb).length && lanDevs.length) {
+			Object.keys(hints).forEach(function(k) {
+				var mac = names.normMac(k);
+				if (!mac || staMacs[mac] || fdb[mac] || ownMacs[mac]) return;
+				var hint = obj(hints[k]), ips = self.hintAddrs(hint, lanSubnets);
+				/* an IPv4 address on a LAN subnet: what the ARP table
+				   knows, so a host that never sent a lease still counts */
+				if (!ips.some(function(a) { return a.indexOf(':') < 0; })) return;
+				wiredMacs.push(mac);
+				fdb[mac] = { port: lanDevs[0], bridge: lanDevs[0], vlan: null, seen: null, approx: true };
+			});
+		}
 		wiredMacs.forEach(function(mac) { everyone.push({ mac: mac, ips: self.hintAddrs(hintOf(mac), wiredSubnets(mac)) }); });
 		var mdns = names.mdnsForStations(raw.mdns, everyone);
 
@@ -869,12 +910,15 @@ return baseclass.extend({
 				ips: ips,
 				port: h.port,
 				bridge: h.bridge,
-				network: lanOf(h) ? lanOf(h).name : null,
+				network: lanOf(h) ? lanOf(h).name : (h.approx && lans[h.port] ? lans[h.port].name : null),
 				vlan: h.vlan,
 				seen: h.seen,
+				approx: h.approx === true,
 				peers: perPort[h.port],
 				shared: perPort[h.port] > 1,
-				speed: sw ? (lit ? lit.speed : null) : d ? self.parseSpeed(d.speed) : null,
+				/* an approximate host's port is the whole interface: its link
+				   is not the client's, so no speed is claimed for it */
+				speed: h.approx ? null : (sw ? (lit ? lit.speed : null) : d ? self.parseSpeed(d.speed) : null),
 				carrier: sw && sw.up != null ? sw.up > 0 : d ? d.carrier !== false : null,
 				switch: sw,
 				switchPort: lit ? lit.label : null,

@@ -790,6 +790,9 @@ return view.extend({
 		/* the host hints: their last reply until they are due */
 		var hintsAge = started - (this.hintsAt || 0);
 		var hintsDue = !this.hintsCache || this.hintsHot > 0 || !(hintsAge >= 0 && hintsAge < HINTS_MS);
+		/* why the forwarding table could not be read, when it could not:
+		   an answer of "none" and a failed call are not the same thing */
+		var fdbError = null;
 		return Promise.all([
 			L.resolveDefault(callInfo(), {}),
 			L.resolveDefault(callRead('/proc/stat'), ''),
@@ -800,7 +803,7 @@ return view.extend({
 			slow ? L.resolveDefault(callWifi(), null) : Promise.resolve(kept.wifi),
 			hintsDue ? L.resolveDefault(callHints(), null) : Promise.resolve(this.hintsCache),
 			slow ? L.resolveDefault(callThermal(), null) : Promise.resolve(kept.thermal),
-			slow ? L.resolveDefault(callWired(), null) : Promise.resolve(kept.wired),
+			slow ? L.resolveDefault(callWired().catch(function(e) { fdbError = e; return null; }), null) : Promise.resolve(kept.wired),
 			/* null when the call fails (an older plugin): netifd's metrics decide */
 			L.resolveDefault(callRoutes(), null)
 		]).then(function(r) {
@@ -934,7 +937,9 @@ return view.extend({
 				var switchState = Object.create(null);
 				Object.keys(swState).forEach(function(n) { switchState[n] = swState[n].ports; });
 				return { info: r[0] || {}, stat: r[1] || '', ifaces: r[2] || [], devs: r[3] || {}, wifi: wifiDevs, hints: r[5] || self.hintsCache || {}, thermal: r[6] || [],
-					fdb: Array.isArray(wiredReply.hosts) ? wiredReply.hosts : [], fdbCrowded: wiredReply.crowded === true, switches: switches, switchState: switchState,
+					fdb: Array.isArray(wiredReply.hosts) ? wiredReply.hosts : [], fdbCrowded: wiredReply.crowded === true,
+					fdbError: fdbError ? String((fdbError && (fdbError.message || fdbError.status || fdbError)) || '') : null,
+					switches: switches, switchState: switchState,
 					/* no answer (an older plugin, a lookup not sent, a failed call)
 					   keeps the last one: no tunnel blinking off */
 					routes: r[8] && Array.isArray(r[8].routes) ? (self.kernelRoutes = r[8].routes) : (self.kernelRoutes || null),
@@ -3449,6 +3454,10 @@ return view.extend({
 			dom.content(el.clientsEmpty, total ? [
 				icon('search'), E('p', { 'class': 'vt-empty-title' }, [ ui.filter ? _('No clients match “%s”').format(fmt.safeText(ui.filter, 40)) : _('No clients in this view') ]),
 				E('button', { 'type': 'button', 'class': 'vt-btn', 'click': function() { ui.chip = 'all'; self.setFilter(''); } }, [ _('Show all clients') ])
+			] : wired && this.lastRaw && this.lastRaw.fdbError ? [
+				icon('router'), E('p', { 'class': 'vt-empty-title' }, [ _('Wired devices could not be read') ]),
+				E('p', {}, [ _('This device answered the request for its forwarding table with “%s”.').format(fmt.safeText(this.lastRaw.fdbError, 80)) ]),
+				E('p', {}, [ _('Install rpcd-mod-ucode and ucode-mod-rtnl, run /etc/init.d/rpcd reload, then log out of LuCI and back in.') ])
 			] : wired && this.lastRaw && this.lastRaw.fdbCrowded ? [
 				icon('router'), E('p', { 'class': 'vt-empty-title' }, [ _('Too many devices to list') ]),
 				E('p', {}, [ _('The bridges have learned so many addresses that listing them here would strain this device.') ])
@@ -3851,7 +3860,8 @@ return view.extend({
 					shared ? E('small', {}, [ _('the port in total: %s').format('↓ ' + fmt.bits(shared.tx) + ' · ↑ ' + fmt.bits(shared.rx)) ]) : ''
 				] : r ?'↓ ' + fmt.bits(r.tx) + ' · ↑ ' + fmt.bits(r.rx) : _('measuring')),
 				kv(_('Network'), [ c.network || c.bridge || fmt.DASH, c.vlan != null ? E('small', {}, [ _('VLAN %d').format(c.vlan) ]) : '' ]),
-				kv(_('Last heard'), c.seen == null ? _('static entry') : fmt.ago(c.seen * 1000))
+				kv(_('Last heard'), c.seen == null ? (c.approx ? _('not known') : _('static entry')) : fmt.ago(c.seen * 1000)),
+				c.approx ? kv(_('Found by', 'vantage'), [ E('span', { 'class': 'vt-muted' }, [ _('the ARP table: the forwarding table could not be read, so the port shown is this LAN interface') ]) ]) : ''
 			]) ]),
 			this.section(_('Identity'), [ E('dl', { 'class': 'vt-kvs' }, [
 				kv(_('MAC address'), c.macLabel, true),

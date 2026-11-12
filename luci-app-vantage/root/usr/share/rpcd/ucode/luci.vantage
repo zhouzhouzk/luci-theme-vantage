@@ -15,7 +15,12 @@
 //   wired      the hosts the Linux bridges have learned on their ports:
 //              MAC, port, bridge, VLAN and seconds since last heard, from a
 //              read-only netlink dump of the forwarding database; at most
-//              128 per port and 512 in all. Not dumped (crowded: true)
+//              128 per port and 512 in all. When the bridges learned
+//              nothing (a LAN that is not a bridge, a dump that failed),
+//              the complete entries of /proc/net/arp stand in, on the
+//              interface they answer on and marked approximate: that is
+//              how the clients of a bridged access point are listed. Not
+//              dumped (crowded: true)
 //              when the bridges hold FDB_LIMIT entries or more between
 //              them, counted first through sysfs without reading further: a flood of
 //              made-up addresses must not make rpcd build the whole
@@ -77,6 +82,7 @@ const MAX_PER_PORT = 128;         // of them on one port (the uplink's would tak
 const PROBE4 = '198.51.100.1';    // routes: looked up, never sent to (documentation ranges)
 const PROBE6 = '2001:db8::1';
 const NET = '/sys/class/net';
+const ARP = '/proc/net/arp';      // complete entries: address, flags, MAC, device
 const FDB_LIMIT = 4096;           // forwarding entries, all bridges together, before wired() lists none
 const FDB_ENTRY = 16;             // sizeof(struct __fdb_entry), brforward's record
 const FDB_DUMP_S = 30;            // the netlink dump at least this often (VLANs, static entries)
@@ -110,6 +116,9 @@ const RE_SWITCH = /^[A-Za-z0-9_.-]{1,32}$/;
 const RE_ROLE = /^[a-z0-9]{1,16}$/;
 const RE_VID = /^[0-9]{1,4}$/;
 const RE_VLAN_DEV = /^[A-Za-z0-9_-]{1,10}\.([0-9]{1,4})$/;  // 'eth1.1'
+/* /proc/net/arp: address, HW type, flags, HW address, mask, device */
+const RE_ARP = /^(\S+)\s+\S+\s+(0x[0-9a-f]{1,8})\s+(\S+)\s+\S+\s+(\S+)/;
+const RE_WAN_DEV = /^(wan|ppp|pppoe|wwan)/;   // a peer beyond these is not a client
 
 /* ------------------------------------------------------------ helpers */
 
@@ -593,6 +602,36 @@ function bridge_table() {
 	return { sig, ages, multi };
 }
 
+// The hosts /proc/net/arp lists as complete (flags 0x2) on an interface
+// that is not a WAN: the answer when the bridges learned nothing, either
+// because the LAN is not a Linux bridge or because the dump could not be
+// taken. It is also how a client of a bridged access point is seen: the
+// bridge learns it on the AP's port, but a LAN with one Ethernet port has
+// no bridge to ask. port is the interface it answers on, bridge null, and
+// seen null (ARP keeps no age); the dashboard marks these approximate.
+function arp_hosts() {
+	let out = [], text = readfile(ARP);
+
+	if (type(text) != 'string')
+		return out;
+
+	for (let line in split(text, '\n')) {
+		let f = match(line, RE_ARP);
+
+		if (!f || f[2] != '0x2' || length(out) >= MAX_HOSTS)
+			continue;
+
+		let mac = norm_mac(f[3]), dev = netdev(f[4]);
+
+		if (!mac || !dev || is_multicast(mac) || match(dev, RE_WAN_DEV))
+			continue;
+
+		push(out, { mac, port: dev, bridge: null, vlan: null, seen: null, approx: true });
+	}
+
+	return out;
+}
+
 // [ { mac, port, bridge, vlan, seen } ] in dump order, at most MAX_HOSTS
 // and MAX_PER_PORT a port: what the bridges learned from their ports.
 // Left out: the bridges' own addresses (permanent), the switch drivers'
@@ -609,12 +648,15 @@ function wired() {
 
 	// the same hosts on the same ports: the last dump's, heard as now
 	// (not when a MAC sits on two ports: each row's own time is the dump's)
-	if (fdb_last && tb.sig != null && !tb.multi && fdb_last.sig === tb.sig && now - fdb_last.at < FDB_DUMP_S)
-		return map(fdb_last.hosts, h => {
+	if (fdb_last && tb.sig != null && !tb.multi && fdb_last.sig === tb.sig && now - fdb_last.at < FDB_DUMP_S) {
+		let same = map(fdb_last.hosts, h => {
 			let a = (h.seen != null && fdb_le != null) ? tb.ages[h.bridge + '|' + h.mac] : null;
 
 			return { mac: h.mac, port: h.port, bridge: h.bridge, vlan: h.vlan, seen: a ? int(a[fdb_le ? 0 : 1] / 100) : h.seen };
 		});
+
+		return length(same) ? same : arp_hosts();
+	}
 
 	let fdb = rtnl.request(rtnl.const.RTM_GETNEIGH, rtnl.const.NLM_F_DUMP, { family: rtnl.const.AF_BRIDGE });
 	let out = [], per = {};
@@ -655,7 +697,8 @@ function wired() {
 
 	fdb_last = (type(fdb) == 'array') ? { at: now, sig: tb.sig, hosts: out } : null;
 
-	return out;
+	// the bridges learned nothing: the ARP table still lists the LAN's hosts
+	return length(out) ? out : arp_hosts();
 }
 
 // [ { family, dev, metric } ] for the families whose lookup answers with
